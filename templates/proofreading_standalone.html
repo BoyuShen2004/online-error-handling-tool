@@ -451,7 +451,7 @@
   canvas {
     border-radius: 0.5rem;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-    image-rendering: pixelated;
+    image-rendering: auto;
     cursor: crosshair;
     display: block;
     margin: auto;
@@ -538,6 +538,7 @@ let paintBrush = 8, eraseBrush = 8, brush = paintBrush;
 let mode = 'add', drawing = false, isNavigating = false;
 const editedSlices = {};
 const undoStacks = {}, redoStacks = {}; // per-slice undo/redo
+let lastBrushX = null, lastBrushY = null; // Track last brush position for smooth drawing
 
 const base = document.getElementById('base');
 const mask = document.getElementById('mask-layer');
@@ -654,8 +655,17 @@ async function loadSlice(){
   const [imgBitmap, maskBitmap] = await Promise.all([
     createImageBitmap(imgBlob), createImageBitmap(maskBlob)
   ]);
+  
+  // Set canvas dimensions
   [base.width, base.height] = [imgBitmap.width, imgBitmap.height];
   [mask.width, mask.height] = [maskBitmap.width, maskBitmap.height];
+  
+  // Canvas size validation - ensure base and mask canvases match
+  if (base.width !== mask.width || base.height !== mask.height) {
+    console.warn('Canvas size mismatch detected - forcing mask to match base canvas');
+    [mask.width, mask.height] = [base.width, base.height];
+  }
+  
   bctx.drawImage(imgBitmap, 0, 0);
   mctx.clearRect(0,0,mask.width,mask.height);
   mctx.drawImage(maskBitmap, 0, 0);
@@ -671,18 +681,65 @@ async function loadSlice(){
 loadSlice();
 
 /* ---- Painting + History ---- */
-base.onmousedown = e => { pushHistory(); drawing = true; paint(e); };
+base.onmousedown = e => { 
+  pushHistory(); 
+  drawing = true; 
+  lastBrushX = null; 
+  lastBrushY = null; // Reset position tracking
+  paint(e); 
+};
 base.onmousemove = e => { if(drawing) paint(e); };
-window.onmouseup  = ()=> drawing = false;
+window.onmouseup  = ()=> { 
+  drawing = false; 
+  lastBrushX = null; 
+  lastBrushY = null; // Reset position tracking
+};
 
 function paint(e){
   const rect = base.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (base.width / rect.width);
-  const y = (e.clientY - rect.top)  * (base.height / rect.height);
+  
+  // Improved coordinate mapping with bounds checking
+  const scaleX = base.width / rect.width;
+  const scaleY = base.height / rect.height;
+  const x = Math.round((e.clientX - rect.left) * scaleX);
+  const y = Math.round((e.clientY - rect.top) * scaleY);
+  
+  // Ensure coordinates are within canvas bounds
+  const clampedX = Math.max(0, Math.min(base.width - 1, x));
+  const clampedY = Math.max(0, Math.min(base.height - 1, y));
+  
   mctx.fillStyle = mode === 'add' ? 'white' : 'black';
+  
+  // Draw smooth brush strokes by connecting points with filled circles
+  if (lastBrushX !== null && lastBrushY !== null) {
+    // Calculate distance between points for smooth interpolation
+    const dx = clampedX - lastBrushX;
+    const dy = clampedY - lastBrushY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    
+    if (distance > 0) {
+      // Interpolate between points to fill gaps
+      const steps = Math.ceil(distance / (brush / 2));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const interpX = lastBrushX + dx * t;
+        const interpY = lastBrushY + dy * t;
+        
+        mctx.beginPath();
+        mctx.arc(interpX, interpY, brush, 0, 2*Math.PI);
+        mctx.fill();
+      }
+    }
+  }
+  
+  // Draw current brush position (filled circle)
   mctx.beginPath();
-  mctx.arc(x, y, brush, 0, 2*Math.PI);
+  mctx.arc(clampedX, clampedY, brush, 0, 2*Math.PI);
   mctx.fill();
+  
+  // Update last position for smooth drawing
+  lastBrushX = clampedX;
+  lastBrushY = clampedY;
 }
 
 /* ---- Undo / Redo ---- */

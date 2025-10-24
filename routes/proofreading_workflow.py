@@ -226,14 +226,21 @@ def api_slice(z):
         
         print(f"DEBUG: Processing slice shape: {sl.shape}")
         
-        # Convert to RGB
+        # Convert to RGB with consistent normalization
         arr = np.asarray(sl)
         if arr.ndim == 3 and arr.shape[-1] == 3:
             rgb = arr.astype(np.uint8)
         else:
-            arr = (arr / arr.max() * 255.0) if arr.max() > 0 else arr
+            # Consistent normalization for all image types
+            if arr.max() > 0:
+                arr = (arr / arr.max() * 255.0)
+            else:
+                arr = arr.astype(np.float64)
             arr = np.clip(arr, 0, 255).astype(np.uint8)
             rgb = np.stack([arr] * 3, axis=-1)
+        
+        # Ensure consistent data type and range
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         
         print(f"DEBUG: RGB shape: {rgb.shape}")
         
@@ -293,7 +300,9 @@ def api_mask(z):
         
         print(f"DEBUG: Processing mask slice shape: {sl.shape}")
         
-        im = Image.fromarray((sl > 0).astype(np.uint8) * 255)
+        # Consistent mask processing
+        mask_binary = (sl > 0).astype(np.uint8) * 255
+        im = Image.fromarray(mask_binary)
         bio = io.BytesIO()
         im.save(bio, format="PNG")
         bio.seek(0)
