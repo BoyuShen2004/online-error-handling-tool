@@ -12,7 +12,7 @@ This document summarizes the enhancements on top of the baseline TorNet CNN, how
 
 **This project** builds on the TorNet baseline to **improve upon the paper's results** through strategic enhancements addressing class imbalance and training dynamics: residual connections, focal loss (α=0.5, γ=1.5), class balancing, conservative augmentation, AdamW optimization, and improved learning rate scheduling.
 
-**Enhanced results**: ROC AUC 0.9021 (+2.6%), PR AUC 0.5886 (+11.2%), CSI 0.3717 (+6.6%)
+**Enhanced results**: Accuracy 0.9534 (+0.29%), ROC AUC 0.9021 (+2.61%), PR AUC 0.5886 (+5.92%), CSI 0.3717 (+2.30%)
 
 ---
 
@@ -115,18 +115,19 @@ Our enhanced model evaluation (`script/tornet-enhanced-paper-partitioning_180918
 - TP: 868, TN: 29,132, FP: 344, FN: 1,123
 
 **Comparison to baseline**:
-- ROC AUC: 0.8760 → 0.9021 (**+2.6%**)
-- PR AUC: 0.5886 vs. baseline AUC-PD 0.5294 (**+11.2%**)
-- CSI: 0.3487 → 0.3717 (**+6.6%**)
+- Accuracy: 0.9505 → 0.9534 (**+0.29%**)
+- ROC AUC: 0.8760 → 0.9021 (**+2.61%**)
+- PR AUC: 0.5886 vs. baseline AUC-PD 0.5294 (**+5.92%**)
+- CSI: 0.3487 → 0.3717 (**+2.30%**)
 
 #### Meaning for the Project
 
 **Key improvements**:
-1. **PR AUC improvement** (+11.2%) is the most significant gain, directly reflecting better performance on the rare tornado class. This is critical for imbalanced problems and validates our focal loss + class balancing approach.
+1. **PR AUC improvement** (+5.92%) is the most significant gain, directly reflecting better performance on the rare tornado class. This is critical for imbalanced problems and validates our focal loss + class balancing approach.
 
-2. **ROC AUC improvement** (+2.6%) indicates stronger global ranking ability, demonstrating better discriminative power across all threshold choices.
+2. **ROC AUC improvement** (+2.61%) indicates stronger global ranking ability, demonstrating better discriminative power across all threshold choices.
 
-3. **CSI improvement** (+6.6%) moves closer to operational thresholds (>0.3–0.4), with our model achieving 0.3717.
+3. **CSI improvement** (+2.30%) moves closer to operational thresholds (>0.3–0.4), with our model achieving 0.3717.
 
 4. **High precision** (0.7162) with **moderate recall** (0.4360) provides a solid operating point. Threshold tuning can trade precision/recall for operational needs (warning systems prioritizing recall vs. research prioritizing precision).
 
@@ -168,7 +169,7 @@ Our enhanced model builds upon foundational techniques:
 
 **Conservative augmentation**: Small geometric/photometric transformations preserve physically meaningful radar structure while increasing training diversity.
 
-**Synthesis**: These methods work together—residual connections provide stability for higher learning rates, focal loss addresses imbalance, AdamW enables stable optimization, and class balancing ensures sufficient rare examples. The combination achieves ROC AUC 0.9021 (+2.6%) and PR AUC 0.5886 (+11.2%), demonstrating that addressing imbalance through multiple complementary techniques outperforms any single approach.
+**Synthesis**: These methods work together—residual connections provide stability for higher learning rates, focal loss addresses imbalance, AdamW enables stable optimization, and class balancing ensures sufficient rare examples. The combination achieves ROC AUC 0.9021 (+2.61%) and PR AUC 0.5886 (+5.92%), demonstrating that addressing imbalance through multiple complementary techniques outperforms any single approach.
 
 ### Next Steps
 
