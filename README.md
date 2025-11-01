@@ -20,7 +20,7 @@ This document summarizes the enhancements on top of the baseline TorNet CNN, how
 
 ### Data Pipeline
 
-#### Data Source
+#### Data Source and Usage
 
 We use the **TorNet dataset** (version 1.1), which consists of **203,133 samples** from **2013–2022** NEXRAD WSR-88D full-resolution polarimetric weather radar data. The dataset was created by MIT Lincoln Laboratory and published as a benchmark for tornado detection research.
 
@@ -30,7 +30,15 @@ We use the **TorNet dataset** (version 1.1), which consists of **203,133 samples
 - **Class distribution**: 124,766 (61.4%) random nontornadic cells, 64,510 (31.8%) nontornadic tornado warnings, 13,857 (6.8%) confirmed tornadoes
 - **EF distribution** within confirmed tornadoes: EF0=5,393; EF1=5,644; EF2=1,997; EF3=651; EF4=172; EF5=0
 
-#### Data Collection and Preprocessing
+<img src="class_composition.png" alt="Class composition" width="640">
+
+**Class imbalance challenges**:
+- Only ~6.8% samples are confirmed tornadoes; most positives are weaker (EF0–EF1)
+- Pixel-level imbalance is even more severe — tornadic signal occupies small fraction of pixels per positive sample
+- Naïve learners collapse to majority predictions (high accuracy, low recall; ROC AUC≈0.50)
+- Our enhancements (focal loss, class balancing, residual connections) specifically address this failure mode
+
+#### Preprocessing Implementation
 
 Following the original paper's methodology, we implement the following preprocessing pipeline:
 
@@ -95,7 +103,7 @@ These baseline results demonstrate reasonable discriminative ability (ROC AUC ~0
 
 ### Preliminary Results
 
-#### Results Summary
+#### Results Presentation
 
 Our enhanced model evaluation (`script/tornet-enhanced-paper-partitioning_1809185.out`) on the JDM test split:
 
@@ -120,10 +128,10 @@ Our enhanced model evaluation (`script/tornet-enhanced-paper-partitioning_180918
 - PR AUC: 0.5886 vs. baseline AUC-PD 0.5294 (**+5.92%**)
 - CSI: 0.3487 → 0.3717 (**+2.30%**)
 
-#### Meaning for the Project
+#### What These Results Mean for the Project
 
 **Key improvements**:
-1. **PR AUC improvement** (+5.92%) is the most significant gain, directly reflecting better performance on the rare tornado class. This is critical for imbalanced problems and validates our focal loss + class balancing approach.
+1. **PR AUC improvement** (+5.92%) is the most significant gain, directly reflecting better performance on the rare tornado class. This validates our focal loss + class balancing approach for imbalanced problems.
 
 2. **ROC AUC improvement** (+2.61%) indicates stronger global ranking ability, demonstrating better discriminative power across all threshold choices.
 
@@ -141,7 +149,7 @@ The observed improvements demonstrate that addressing class imbalance through ar
 - Ensemble methods combining multiple models
 - Threshold optimization for specific operational contexts
 
-#### Challenges Encountered
+#### Challenges Encountered That Influenced These Results
 
 **Primary challenge**: Extreme class imbalance (6.8% tornado samples) causing naïve models to collapse toward majority-class predictions (high accuracy but low recall, ROC AUC≈0.50).
 
@@ -153,27 +161,11 @@ The observed improvements demonstrate that addressing class imbalance through ar
 
 **Training dynamics challenges**: Initial attempts with standard Adam and cross-entropy loss showed poor convergence. Switching to AdamW with decoupled weight decay and learning rate scheduling enabled stable training with the higher learning rates (1e-3) needed for focal loss effectiveness.
 
-#### Literature Review (Condensed)
-
-Our enhanced model builds upon foundational techniques:
-
-**Residual connections** (He et al., 2016): Identity skip connections enable direct gradient flow, mitigating vanishing gradients. We added residual skips to VGG-style blocks, enabling stable training with higher learning rates (1e-3 vs. baseline 1e-4).
-
-**Focal loss** (Lin et al., 2017): Addresses extreme class imbalance by downweighting easy examples and focusing on hard examples. We use `α=0.5` and `γ=1.5`, dramatically improving PR AUC (0.589 vs. baseline AUC-PD 0.529).
-
-**AdamW optimizer** (Loshchilov & Hutter, 2017): Decouples weight decay from gradient updates, enabling proper regularization. Critical for stable training with higher learning rates.
-
-**Learning rate scheduling**: Cosine annealing with warmup and ReduceLROnPlateau ensures optimal convergence, preventing plateaus common with imbalanced data.
-
-**Class balancing** (SMOTE, Chawla et al., 2002): Combined class weighting and moderate oversampling (ratio=2.0) ensures sufficient exposure to rare tornado examples.
-
-**Conservative augmentation**: Small geometric/photometric transformations preserve physically meaningful radar structure while increasing training diversity.
-
-**Synthesis**: These methods work together—residual connections provide stability for higher learning rates, focal loss addresses imbalance, AdamW enables stable optimization, and class balancing ensures sufficient rare examples. The combination achieves ROC AUC 0.9021 (+2.61%) and PR AUC 0.5886 (+5.92%), demonstrating that addressing imbalance through multiple complementary techniques outperforms any single approach.
+**Literature foundations**: Our enhancements build upon established methods: residual connections (He et al., 2016), focal loss (Lin et al., 2017), AdamW optimizer (Loshchilov & Hutter, 2017), class balancing techniques (SMOTE, Chawla et al., 2002), and conservative data augmentation approaches. See Technical Documentation for detailed explanations.
 
 ### Next Steps
 
-**Objective**: Build an alternative deep learning model using a different architecture paradigm to achieve comparable or better results than our enhanced CNN model.
+**Objectives**: Build an alternative deep learning model using a different architecture paradigm to achieve comparable or better results than our enhanced CNN model.
 
 **Motivation**: 
 1. **Architectural diversity**: Explore whether transformer-based architectures or foundational models can capture different patterns in radar data compared to CNNs
@@ -291,8 +283,8 @@ Our enhanced model builds upon several foundational techniques from deep learnin
 - **Hard negatives**: Non-tornadic cases that resemble tornadic patterns (reducing false alarms)
 
 **Impact on tornado detection**:
-- Dramatically improves PR AUC (0.589 vs. baseline AUC-PD 0.529), reflecting better performance on the minority class
-- Reduces the model's tendency to collapse toward majority-class predictions (baseline struggle: AUC≈0.50 with naïve training)
+- Dramatically improves PR AUC (0.5886 vs. baseline AUC-PD 0.5294), reflecting better performance on the minority class
+- Reduces the model's tendency to collapse toward majority-class predictions (baseline struggle: ROC AUC≈0.50 with naïve training)
 - Enables the model to learn from difficult tornado cases (EF0–EF1) that constitute most of the positive class
 
 #### AdamW Optimizer with Decoupled Weight Decay
@@ -484,7 +476,7 @@ Explainable AI (XAI) methods help attribute the observed improvements to our arc
    - **Expected patterns**: Enhanced curve should dominate baseline across most thresholds
    - **Method contribution**: 
      - Focal loss improves ranking of positives vs. negatives (Lin et al., 2017), directly improving ROC AUC
-     - Class balancing and focal loss together improve precision-recall trade-off, boosting PR AUC (observed: 0.589 vs. baseline AUC-PD 0.529)
+     - Class balancing and focal loss together improve precision-recall trade-off, boosting PR AUC (observed: 0.5886 vs. baseline AUC-PD 0.5294)
    - **Validation**: Enhanced curves should lie above baseline, with gains matching observed ROC AUC≈0.90 and PR AUC≈0.589, explaining improved CSI/F1 at practical thresholds
 
 #### Implementation Notes
@@ -542,19 +534,3 @@ sbatch slurm_scripts/evaluate_enhanced_paper_partitioning.sl /abs/path/to/model.
 
 - Actual training settings come from `params_enhanced_tornet.json` (epochs=20, batch_size=64, learning_rate=1e-3, start_filters=16, focal_imbalanced α=0.5/γ=1.5). Code defaults are placeholders overridden by params files in SLURM scripts.
 - `simple_enhanced_cnn.py` implements VGG + residual connections; attention/multiscale flags are ignored (kept off for stability).
-
-### Dataset Details and Class Imbalance
-
-<img src="class_composition.png" alt="Class composition" width="640">
-
-**Class composition** (203,133 samples total):
-- Random nontornadic cells: 124,766 (61.4%)
-- Nontornadic tornado warnings: 64,510 (31.8%)
-- Confirmed tornadoes: 13,857 (6.8%)
-- EF distribution within confirmed tornadoes: EF0=5,393; EF1=5,644; EF2=1,997; EF3=651; EF4=172; EF5=0
-
-**Imbalance challenges**:
-- Only ~6.8% samples are confirmed tornadoes; most positives are weaker (EF0–EF1)
-- Pixel-level imbalance is even more severe — tornadic signal occupies small fraction of pixels per positive sample
-- Naïve learners collapse to majority predictions (high accuracy, low recall; ROC AUC≈0.50)
-- Our enhancements (focal loss, class balancing, residual connections) specifically address this failure mode
