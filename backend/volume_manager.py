@@ -185,7 +185,7 @@ def list_images_for_path(path):
     filtered = []
     for fp in files:
         base, ext = os.path.splitext(os.path.basename(fp))
-        if base.endswith("_mask"):
+        if base.endswith("_mask") or base.endswith("_prediction"):
             continue
         filtered.append(fp)
 
@@ -239,6 +239,14 @@ def build_mask_stack_from_pairs(image_files, mask_base_dir=None):
             if os.path.exists(candidate):
                 mask_fp = candidate
                 break
+
+        # 1b) Model prediction naming: <base>_prediction<ext>
+        if mask_fp is None:
+            for e in try_exts:
+                candidate = os.path.join(search_dir, f"{base}_prediction{e}")
+                if os.path.exists(candidate):
+                    mask_fp = candidate
+                    break
 
         # 2) nnUNet preprocessed style: mask name equals image name without trailing "_0000"
         if mask_fp is None and base.endswith("_0000"):

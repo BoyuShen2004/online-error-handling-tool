@@ -1,11 +1,81 @@
+import base64
+import io
 import os
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import cv2
+import numpy as np
 import tifffile
 from PIL import Image
-from typing import Tuple, Optional, List, Dict, Any, Union
-import io
-import base64
+
+
+def _ensure_grayscale_2d(arr: np.ndarray, kind: str) -> np.ndarray:
+    """
+    Ensure an array is 2D grayscale.
+
+    Args:
+        arr: Input array that may be 2D or multi-channel.
+        kind: Text description used in error messages.
+    """
+    if arr.ndim == 2:
+        return arr
+
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            return arr[:, :, 0]
+        return np.mean(arr[:, :, :3], axis=2)
+
+    raise ValueError(f"Unsupported {kind} dimensions: {arr.ndim}")
+
+
+def _prepare_mask_for_display(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Convert mask data into uint8 [0, 255] for visualization purposes."""
+    if mask is None:
+        return None
+
+    mask_arr = np.asarray(mask)
+
+    if mask_arr.dtype != np.uint8:
+        mask_arr = mask_arr.astype(np.float32)
+        if mask_arr.size == 0:
+            return np.zeros_like(mask_arr, dtype=np.uint8)
+
+        max_val = float(mask_arr.max())
+        min_val = float(mask_arr.min())
+
+        if max_val <= 1.0 and min_val >= 0.0:
+            mask_arr *= 255.0
+        elif max_val > min_val:
+            mask_arr = (mask_arr - min_val) / (max_val - min_val)
+            mask_arr *= 255.0
+
+        mask_arr = np.clip(mask_arr, 0, 255).astype(np.uint8)
+    else:
+        # Promote {0,1} masks to {0,255} for visibility
+        unique_vals = np.unique(mask_arr)
+        if unique_vals.size <= 2 and set(unique_vals.tolist()).issubset({0, 1}):
+            mask_arr = (mask_arr * 255).astype(np.uint8)
+
+    return mask_arr
+
+
+def _mask_to_reference_scale(mask: Optional[np.ndarray], reference: np.ndarray) -> Optional[np.ndarray]:
+    """Match mask dtype/range to the reference image for serialization."""
+    if mask is None:
+        return None
+
+    mask_bool = (np.asarray(mask) > 0)
+    ref_dtype = reference.dtype
+
+    if np.issubdtype(ref_dtype, np.integer):
+        info = np.iinfo(ref_dtype)
+        high = info.max
+        return (mask_bool.astype(ref_dtype)) * high
+    elif np.issubdtype(ref_dtype, np.floating):
+        return mask_bool.astype(ref_dtype)
+    else:
+        # Fallback to uint8 if dtype is unexpected
+        return (mask_bool.astype(np.uint8)) * 255
 
 class DataManager:
     """
@@ -210,16 +280,8 @@ class DataManager:
         Returns: RGB overlay image
         """
         # Ensure image_slice is 2D
-        if image_slice.ndim != 2:
-            if image_slice.ndim == 3:
-                # If 3D, take the first slice or convert to grayscale
-                if image_slice.shape[2] == 1:
-                    image_slice = image_slice[:, :, 0]
-                else:
-                    image_slice = np.mean(image_slice, axis=2)
-            else:
-                raise ValueError(f"Unsupported image slice dimensions: {image_slice.ndim}")
-        
+        image_slice = _ensure_grayscale_2d(image_slice, "image slice")
+
         # Normalize image to 0-255
         if image_slice.max() > 1:
             img_norm = image_slice.astype(np.float32)
@@ -232,40 +294,18 @@ class DataManager:
         img_rgb = np.stack([img_norm] * 3, axis=-1)
 
         if mask_slice is not None:
-            # Ensure mask_slice is 2D and has same dimensions as image
-            if mask_slice.ndim != 2:
-                if mask_slice.ndim == 3:
-                    if mask_slice.shape[2] == 1:
-                        mask_slice = mask_slice[:, :, 0]
-                    else:
-                        mask_slice = np.mean(mask_slice, axis=2)
-                else:
-                    raise ValueError(f"Unsupported mask slice dimensions: {mask_slice.ndim}")
-            
-            # Ensure mask has same dimensions as image
+            mask_slice = _ensure_grayscale_2d(mask_slice, "mask slice")
+            mask_slice = _prepare_mask_for_display(mask_slice)
+
             if mask_slice.shape != image_slice.shape:
-                # Resize mask to match image dimensions
                 mask_slice = cv2.resize(mask_slice, (image_slice.shape[1], image_slice.shape[0]), 
                                       interpolation=cv2.INTER_NEAREST)
             
-            # Create colored mask overlay
             mask_binary = (mask_slice > 0).astype(np.uint8)
-            
-            # Create colored overlay (red for mask)
-            overlay = img_rgb.copy()
-            
-            # Apply mask overlay channel by channel
-            mask_indices = mask_binary > 0
-            if np.any(mask_indices):
-                # Red channel: increase red
-                overlay[mask_indices, 0] = np.minimum(255, overlay[mask_indices, 0] + 100)
-                # Green channel: decrease green
-                overlay[mask_indices, 1] = np.maximum(0, overlay[mask_indices, 1] - 50)
-                # Blue channel: decrease blue
-                overlay[mask_indices, 2] = np.maximum(0, overlay[mask_indices, 2] - 50)
-            
-            # Blend with original image
-            img_rgb = cv2.addWeighted(img_rgb, 1-alpha, overlay, alpha, 0)
+            if np.any(mask_binary):
+                overlay_color = np.zeros_like(img_rgb, dtype=np.uint8)
+                overlay_color[mask_binary > 0] = np.array([255, 0, 0], dtype=np.uint8)
+                img_rgb = cv2.addWeighted(img_rgb, 1 - alpha, overlay_color, alpha, 0)
 
         return img_rgb
 
@@ -289,10 +329,15 @@ class DataManager:
         """
         overlay = self.create_overlay(image_slice, mask_slice)
         
+        mask_serialized = None
+        if mask_slice is not None:
+            mask_for_serialization = _mask_to_reference_scale(mask_slice, image_slice)
+            mask_serialized = self.array_to_base64(mask_for_serialization)
+
         return {
             "z": z,
             "image_slice": self.array_to_base64(image_slice),
-            "mask_slice": self.array_to_base64(mask_slice) if mask_slice is not None else None,
+            "mask_slice": mask_serialized,
             "overlay": self.array_to_base64(overlay),
             "has_mask": mask_slice is not None,
             "mask_coverage": float(np.sum(mask_slice > 0) / mask_slice.size) if mask_slice is not None else 0.0
