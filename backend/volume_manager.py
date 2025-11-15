@@ -218,7 +218,50 @@ def build_mask_stack_from_pairs(image_files, mask_base_dir=None):
     h, w = arr0.shape[-2], arr0.shape[-1]
 
     mask_slices = []
+<<<<<<< HEAD
     for mask_fp in mask_paths:
+=======
+    for img_fp in image_files:
+        base, ext = os.path.splitext(os.path.basename(img_fp))
+        # Prefer same extension mask
+        candidates = []
+        if mask_base_dir is None:
+            search_dir = os.path.dirname(img_fp)
+        else:
+            search_dir = mask_base_dir
+
+        # try same ext first, then fallback to common ones
+        try_exts = [ext.lower()]
+        for e in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+            if e not in try_exts:
+                try_exts.append(e)
+
+        mask_fp = None
+        # 1) Conventional: <base>_mask<ext>
+        for e in try_exts:
+            candidate = os.path.join(search_dir, f"{base}_mask{e}")
+            if os.path.exists(candidate):
+                mask_fp = candidate
+                break
+
+        # 1b) Model prediction naming: <base>_prediction<ext>
+        if mask_fp is None:
+            for e in try_exts:
+                candidate = os.path.join(search_dir, f"{base}_prediction{e}")
+                if os.path.exists(candidate):
+                    mask_fp = candidate
+                    break
+
+        # 2) nnUNet preprocessed style: mask name equals image name without trailing "_0000"
+        if mask_fp is None and base.endswith("_0000"):
+            trimmed = base[:-5]  # remove suffix "_0000"
+            for e in try_exts:
+                candidate = os.path.join(search_dir, f"{trimmed}{e}")
+                if os.path.exists(candidate):
+                    mask_fp = candidate
+                    break
+
+>>>>>>> 3f56e9f990b99809b40b97f25513b326deedeb57
         if mask_fp is None:
             mask_slices.append(np.zeros((h, w), dtype=np.uint8))
             continue

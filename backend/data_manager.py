@@ -8,9 +8,12 @@ import numpy as np
 import tifffile
 from PIL import Image
 
+<<<<<<< HEAD
 from backend.lazy_stack import LazySliceLoader, LazyMaskLoader
 from backend.volume_manager import list_images_for_path, build_mask_path_mapping
 
+=======
+>>>>>>> 3f56e9f990b99809b40b97f25513b326deedeb57
 
 def _ensure_grayscale_2d(arr: np.ndarray, kind: str) -> np.ndarray:
     """
