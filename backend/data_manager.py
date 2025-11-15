@@ -1,11 +1,84 @@
+import base64
+import io
 import os
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import cv2
+import numpy as np
 import tifffile
 from PIL import Image
-from typing import Tuple, Optional, List, Dict, Any, Union
-import io
-import base64
+
+from backend.lazy_stack import LazySliceLoader, LazyMaskLoader
+from backend.volume_manager import list_images_for_path, build_mask_path_mapping
+
+
+def _ensure_grayscale_2d(arr: np.ndarray, kind: str) -> np.ndarray:
+    """
+    Ensure an array is 2D grayscale.
+
+    Args:
+        arr: Input array that may be 2D or multi-channel.
+        kind: Text description used in error messages.
+    """
+    if arr.ndim == 2:
+        return arr
+
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            return arr[:, :, 0]
+        return np.mean(arr[:, :, :3], axis=2)
+
+    raise ValueError(f"Unsupported {kind} dimensions: {arr.ndim}")
+
+
+def _prepare_mask_for_display(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Convert mask data into uint8 [0, 255] for visualization purposes."""
+    if mask is None:
+        return None
+
+    mask_arr = np.asarray(mask)
+
+    if mask_arr.dtype != np.uint8:
+        mask_arr = mask_arr.astype(np.float32)
+        if mask_arr.size == 0:
+            return np.zeros_like(mask_arr, dtype=np.uint8)
+
+        max_val = float(mask_arr.max())
+        min_val = float(mask_arr.min())
+
+        if max_val <= 1.0 and min_val >= 0.0:
+            mask_arr *= 255.0
+        elif max_val > min_val:
+            mask_arr = (mask_arr - min_val) / (max_val - min_val)
+            mask_arr *= 255.0
+
+        mask_arr = np.clip(mask_arr, 0, 255).astype(np.uint8)
+    else:
+        # Promote {0,1} masks to {0,255} for visibility
+        unique_vals = np.unique(mask_arr)
+        if unique_vals.size <= 2 and set(unique_vals.tolist()).issubset({0, 1}):
+            mask_arr = (mask_arr * 255).astype(np.uint8)
+
+    return mask_arr
+
+
+def _mask_to_reference_scale(mask: Optional[np.ndarray], reference: np.ndarray) -> Optional[np.ndarray]:
+    """Match mask dtype/range to the reference image for serialization."""
+    if mask is None:
+        return None
+
+    mask_bool = (np.asarray(mask) > 0)
+    ref_dtype = reference.dtype
+
+    if np.issubdtype(ref_dtype, np.integer):
+        info = np.iinfo(ref_dtype)
+        high = info.max
+        return (mask_bool.astype(ref_dtype)) * high
+    elif np.issubdtype(ref_dtype, np.floating):
+        return mask_bool.astype(ref_dtype)
+    else:
+        # Fallback to uint8 if dtype is unexpected
+        return (mask_bool.astype(np.uint8)) * 255
 
 class DataManager:
     """
@@ -19,70 +92,53 @@ class DataManager:
         self.volume_info = {}
         self.mask_info = {}
 
+    def _resolve_slice_index(self, z: int) -> int:
+        total = self.volume_info.get("num_slices")
+        if total is None and hasattr(self.current_volume, 'shape'):
+            shape = getattr(self.current_volume, 'shape', None)
+            if isinstance(shape, tuple) and shape:
+                total = shape[0]
+        if total is None and hasattr(self.current_volume, 'ndim') and getattr(self.current_volume, 'ndim', 0) == 3:
+            total = self.current_volume.shape[0]
+        if not total or total <= 0:
+            total = 1
+        return max(0, min(z, total - 1))
+
+    def _get_mask_slice_for_index(self, z: int):
+        if self.current_mask is None:
+            return None
+        if hasattr(self.current_mask, 'get_slice'):
+            return self.current_mask.get_slice(z)
+        if getattr(self.current_mask, 'ndim', 0) == 2:
+            return self.current_mask
+        return self.current_mask[z]
+
     def load_image(self, image_path: Union[str, List[str]]) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Load image data from file path, directory/glob, or list of files.
         Returns: (image_array, metadata_dict)
         """
-        # If list of files is provided, stack them
-        if isinstance(image_path, list):
-            from backend.volume_manager import _to_uint8  # reuse normalization
-            import cv2
-            if not image_path:
-                raise FileNotFoundError("No files provided for loading")
-            files = list(image_path)
-            slices = []
-            target_shape = None
-            for fp in files:
-                ext = os.path.splitext(fp.lower())[1]
-                if ext in ['.tif', '.tiff']:
-                    arr = tifffile.imread(fp)
-                    if arr.ndim != 2:
-                        raise ValueError(f"Expected 2D TIFF for stacking, got {arr.shape}")
-                else:
-                    img = Image.open(fp)
-                    arr = np.array(img)
-                    if arr.ndim == 3:
-                        if arr.shape[2] == 3:
-                            arr = np.mean(arr, axis=2).astype(arr.dtype)
-                        elif arr.shape[2] == 4:
-                            arr = np.mean(arr[:, :, :3], axis=2).astype(arr.dtype)
-                        else:
-                            arr = arr[:, :, 0]
-                    elif arr.ndim != 2:
-                        raise ValueError(f"Unsupported image dims {arr.ndim} for {fp}")
-                arr = _to_uint8(arr)
-                if target_shape is None:
-                    target_shape = arr.shape
-                elif arr.shape != target_shape:
-                    arr = cv2.resize(arr, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
-                slices.append(arr)
-            volume = np.stack(slices, axis=0)
+        # If list/dir/glob of files is provided, lazily stream them
+        if isinstance(image_path, list) or any(ch in str(image_path) for ch in ['*', '?', '[']) or os.path.isdir(image_path):
+            if isinstance(image_path, list):
+                files = list(image_path)
+            else:
+                files = list_images_for_path(image_path)
+            if not files:
+                raise FileNotFoundError("No image files found for loading")
+            loader = LazySliceLoader(files)
             info = {
-                "shape": volume.shape,
-                "dtype": str(volume.dtype),
-                "ndim": volume.ndim,
+                "shape": loader.shape,
+                "dtype": str(loader.dtype),
+                "ndim": loader.ndim,
                 "is_3d": True,
-                "num_slices": volume.shape[0]
+                "num_slices": loader.shape[0],
+                "lazy": True
             }
-            self.current_volume = volume
+            self.current_volume = loader
             self.volume_info = info
-            return volume, info
+            return loader, info
 
-        # Allow directory or glob pattern
-        if any(ch in str(image_path) for ch in ['*', '?', '[']) or os.path.isdir(image_path):
-            from backend.volume_manager import load_image_or_stack
-            volume = load_image_or_stack(image_path)
-            info = {
-                "shape": volume.shape,
-                "dtype": str(volume.dtype),
-                "ndim": volume.ndim,
-                "is_3d": volume.ndim == 3,
-                "num_slices": volume.shape[0] if volume.ndim == 3 else 1
-            }
-            self.current_volume = volume
-            self.volume_info = info
-            return volume, info
 
         if not os.path.exists(image_path):
             raise FileNotFoundError(f"Image file not found: {image_path}")
@@ -193,14 +249,17 @@ class DataManager:
         if self.current_volume is None:
             raise ValueError("No volume loaded")
 
-        if self.current_volume.ndim == 2:
+        if hasattr(self.current_volume, 'get_slice'):
+            z = self._resolve_slice_index(z)
+            image_slice = self.current_volume.get_slice(z)
+        elif getattr(self.current_volume, 'ndim', 0) == 2:
             image_slice = self.current_volume
-            mask_slice = self.current_mask if self.current_mask is not None else None
+            z = 0
         else:
-            z = max(0, min(z, self.current_volume.shape[0] - 1))
+            z = self._resolve_slice_index(z)
             image_slice = self.current_volume[z]
-            mask_slice = self.current_mask[z] if self.current_mask is not None else None
 
+        mask_slice = self._get_mask_slice_for_index(z)
         return image_slice, mask_slice
 
     def create_overlay(self, image_slice: np.ndarray, mask_slice: Optional[np.ndarray], 
@@ -210,16 +269,8 @@ class DataManager:
         Returns: RGB overlay image
         """
         # Ensure image_slice is 2D
-        if image_slice.ndim != 2:
-            if image_slice.ndim == 3:
-                # If 3D, take the first slice or convert to grayscale
-                if image_slice.shape[2] == 1:
-                    image_slice = image_slice[:, :, 0]
-                else:
-                    image_slice = np.mean(image_slice, axis=2)
-            else:
-                raise ValueError(f"Unsupported image slice dimensions: {image_slice.ndim}")
-        
+        image_slice = _ensure_grayscale_2d(image_slice, "image slice")
+
         # Normalize image to 0-255
         if image_slice.max() > 1:
             img_norm = image_slice.astype(np.float32)
@@ -232,40 +283,18 @@ class DataManager:
         img_rgb = np.stack([img_norm] * 3, axis=-1)
 
         if mask_slice is not None:
-            # Ensure mask_slice is 2D and has same dimensions as image
-            if mask_slice.ndim != 2:
-                if mask_slice.ndim == 3:
-                    if mask_slice.shape[2] == 1:
-                        mask_slice = mask_slice[:, :, 0]
-                    else:
-                        mask_slice = np.mean(mask_slice, axis=2)
-                else:
-                    raise ValueError(f"Unsupported mask slice dimensions: {mask_slice.ndim}")
-            
-            # Ensure mask has same dimensions as image
+            mask_slice = _ensure_grayscale_2d(mask_slice, "mask slice")
+            mask_slice = _prepare_mask_for_display(mask_slice)
+
             if mask_slice.shape != image_slice.shape:
-                # Resize mask to match image dimensions
                 mask_slice = cv2.resize(mask_slice, (image_slice.shape[1], image_slice.shape[0]), 
                                       interpolation=cv2.INTER_NEAREST)
             
-            # Create colored mask overlay
             mask_binary = (mask_slice > 0).astype(np.uint8)
-            
-            # Create colored overlay (red for mask)
-            overlay = img_rgb.copy()
-            
-            # Apply mask overlay channel by channel
-            mask_indices = mask_binary > 0
-            if np.any(mask_indices):
-                # Red channel: increase red
-                overlay[mask_indices, 0] = np.minimum(255, overlay[mask_indices, 0] + 100)
-                # Green channel: decrease green
-                overlay[mask_indices, 1] = np.maximum(0, overlay[mask_indices, 1] - 50)
-                # Blue channel: decrease blue
-                overlay[mask_indices, 2] = np.maximum(0, overlay[mask_indices, 2] - 50)
-            
-            # Blend with original image
-            img_rgb = cv2.addWeighted(img_rgb, 1-alpha, overlay, alpha, 0)
+            if np.any(mask_binary):
+                overlay_color = np.zeros_like(img_rgb, dtype=np.uint8)
+                overlay_color[mask_binary > 0] = np.array([255, 0, 0], dtype=np.uint8)
+                img_rgb = cv2.addWeighted(img_rgb, 1 - alpha, overlay_color, alpha, 0)
 
         return img_rgb
 
@@ -289,10 +318,15 @@ class DataManager:
         """
         overlay = self.create_overlay(image_slice, mask_slice)
         
+        mask_serialized = None
+        if mask_slice is not None:
+            mask_for_serialization = _mask_to_reference_scale(mask_slice, image_slice)
+            mask_serialized = self.array_to_base64(mask_for_serialization)
+
         return {
             "z": z,
             "image_slice": self.array_to_base64(image_slice),
-            "mask_slice": self.array_to_base64(mask_slice) if mask_slice is not None else None,
+            "mask_slice": mask_serialized,
             "overlay": self.array_to_base64(overlay),
             "has_mask": mask_slice is not None,
             "mask_coverage": float(np.sum(mask_slice > 0) / mask_slice.size) if mask_slice is not None else 0.0
@@ -354,14 +388,13 @@ class DataManager:
         if self.current_volume is None or self.current_mask is None:
             return True  # No mask is valid
 
-        # Check dimensions
-        if self.current_volume.ndim != self.current_mask.ndim:
+        try:
+            image_slice, mask_slice = self.get_slice(0)
+            if mask_slice is None:
+                return True
+            return image_slice.shape == mask_slice.shape
+        except Exception:
             return False
-
-        if self.current_volume.ndim == 2:
-            return self.current_volume.shape == self.current_mask.shape
-        else:
-            return self.current_volume.shape == self.current_mask.shape
 
     def get_data_summary(self) -> Dict[str, Any]:
         """Get summary of loaded data."""

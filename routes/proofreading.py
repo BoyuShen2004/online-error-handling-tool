@@ -11,6 +11,73 @@ import numpy as np
 from flask import Blueprint, render_template, request, current_app, jsonify, send_file, redirect, url_for
 from PIL import Image
 from backend.volume_manager import list_images_for_path, load_image_or_stack, load_mask_like, save_mask, stack_2d_images
+def _cached_detection_image_files():
+    files = current_app.config.get("DETECTION_IMAGE_FILES")
+    if files:
+        return files
+    session_manager = current_app.session_manager
+    session_state = session_manager.snapshot()
+    image_path = session_state.get("image_path", "")
+    files = list_images_for_path(image_path)
+    current_app.config["DETECTION_IMAGE_FILES"] = files
+    return files
+
+
+def _resolve_detection_mask(img_fp, idx):
+    mask_files = current_app.config.get("DETECTION_MASK_FILES")
+    if mask_files and idx < len(mask_files):
+        mask_fp = mask_files[idx]
+        if mask_fp:
+            return mask_fp
+
+    def build_exts(ext):
+        exts = [ext.lower()]
+        for e in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+            if e not in exts:
+                exts.append(e)
+        return exts
+
+    def try_dir(dir_path, base_name, extensions):
+        if not dir_path or not os.path.isdir(dir_path):
+            return None
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_mask{e}")
+            if os.path.exists(cand):
+                return cand
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_prediction{e}")
+            if os.path.exists(cand):
+                return cand
+        if base_name.endswith("_0000"):
+            trimmed = base_name[:-5]
+            for e in extensions:
+                cand = os.path.join(dir_path, f"{trimmed}{e}")
+                if os.path.exists(cand):
+                    return cand
+        return None
+
+    if not img_fp:
+        return None
+
+    base, ext = os.path.splitext(os.path.basename(img_fp))
+    extensions = build_exts(ext)
+    session_state = current_app.session_manager.snapshot()
+    mask_path = session_state.get("mask_path", "")
+    search_dirs = []
+    if mask_path and os.path.isdir(mask_path):
+        search_dirs.append(mask_path)
+    img_dir = os.path.dirname(img_fp)
+    if img_dir:
+        search_dirs.append(img_dir)
+
+    for d in search_dirs:
+        result = try_dir(d, base, extensions)
+        if result:
+            return result
+
+    if mask_path and os.path.isfile(mask_path):
+        return mask_path
+    return None
 from backend.utils import jsonify_dimensions
 
 bp = Blueprint("proofreading", __name__, url_prefix="")
@@ -83,34 +150,35 @@ def proofreading_edit(layer_id):
     # Load volume and mask for proofreading
     try:
         # Try to get data from detection workflow first
+        data_manager = current_app.config.get("DETECTION_DATA_MANAGER")
         volume = current_app.config.get("DETECTION_VOLUME")
         mask = current_app.config.get("DETECTION_MASK")
         
-        # If not available, try to load from session paths
-        if volume is None:
-            ipath = session_state.get("image_path", "")
-            volume = stack_2d_images(ipath) if isinstance(ipath, list) else load_image_or_stack(ipath)
-        if mask is None:
-            mask = load_mask_like(session_state.get("mask_path"), volume)
-        
         # Get the specific slice for this incorrect layer
-        slice_idx = current_layer.get("z", 0)  # Use 'z' field from layer data
-        
-        # Debug: Print the slice index being loaded
+        slice_idx = current_layer.get("z", 0)
         print(f"Loading incorrect layer {current_layer['id']} at slice index {slice_idx}")
         
-        # Extract only the slice we need for this incorrect layer
-        if volume.ndim == 3:
-            if slice_idx >= volume.shape[0]:
-                raise ValueError(f"Slice index {slice_idx} out of range for volume with {volume.shape[0]} slices")
-            image_slice = volume[slice_idx]
-            mask_slice = mask[slice_idx] if mask is not None and mask.ndim == 3 else mask
+        image_slice = None
+        mask_slice = None
+        if data_manager is not None:
+            image_slice, mask_slice = data_manager.get_slice(slice_idx)
         else:
-            # For 2D images, we still use the slice index to determine which layer
-            image_slice = volume
-            mask_slice = mask
+            # Fallback to eager loading when data manager is unavailable
+            if volume is None:
+                ipath = session_state.get("image_path", "")
+                volume = stack_2d_images(ipath) if isinstance(ipath, list) else load_image_or_stack(ipath)
+            if mask is None:
+                mask = load_mask_like(session_state.get("mask_path"), volume)
+
+            if volume.ndim == 3:
+                if slice_idx >= volume.shape[0]:
+                    raise ValueError(f"Slice index {slice_idx} out of range for volume with {volume.shape[0]} slices")
+                image_slice = volume[slice_idx]
+                mask_slice = mask[slice_idx] if mask is not None and getattr(mask, 'ndim', 0) == 3 else mask
+            else:
+                image_slice = volume
+                mask_slice = mask
         
-        # Debug: Print mask info
         print(f"Image slice shape: {image_slice.shape}")
         print(f"Mask slice shape: {mask_slice.shape if mask_slice is not None else 'None'}")
         print(f"Mask slice type: {type(mask_slice)}")
@@ -347,53 +415,19 @@ def api_mask(slice_idx):
 def api_names_current():
     """Return the current image filename and paired mask filename for the incorrect-layer proofreading view."""
     try:
-        session_manager = current_app.session_manager
-        session_state = session_manager.snapshot()
-        image_path = session_state.get("image_path", "")
-        mask_path = session_state.get("mask_path", "")
         slice_idx = current_app.config.get("CURRENT_SLICE_INDEX", 0)
 
-        images = list_images_for_path(image_path)
+        images = _cached_detection_image_files()
         if not images:
-            # fallback to single file path
+            session_state = current_app.session_manager.snapshot()
+            image_path = session_state.get("image_path", "")
             img_fp = image_path if isinstance(image_path, str) else None
         else:
             img_fp = images[slice_idx] if slice_idx < len(images) else images[-1]
 
         img_name = os.path.basename(img_fp) if img_fp else None
-
-        # Determine mask candidate
-        mask_dir = mask_path if (mask_path and os.path.isdir(mask_path)) else (os.path.dirname(img_fp) if img_fp else None)
-        mask_name = None
-        if img_fp and mask_dir:
-            base, ext = os.path.splitext(os.path.basename(img_fp))
-            # 1) Conventional: <base>_mask<ext>
-            found_path = None
-            for e in [ext.lower(), ".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                cand = os.path.join(mask_dir, f"{base}_mask{e}")
-                if os.path.exists(cand):
-                    found_path = cand
-                    mask_name = os.path.basename(cand)
-                    break
-            # 2) nnUNet preprocessed: mask equals image without trailing "_0000"
-            if mask_name is None and base.endswith("_0000"):
-                trimmed = base[:-5]
-                for e in [ext.lower(), ".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                    cand = os.path.join(mask_dir, f"{trimmed}{e}")
-                    if os.path.exists(cand):
-                        found_path = cand
-                        mask_name = os.path.basename(cand)
-                        break
-
-            # If image and mask paths are the same folder and a pair was found, suppress independent mask display
-            same_folder = False
-            try:
-                same_folder = (mask_path and os.path.isdir(mask_path) and os.path.abspath(mask_path) == os.path.abspath(os.path.dirname(img_fp))) or \
-                              (isinstance(image_path, str) and os.path.isdir(image_path) and mask_path and os.path.isdir(mask_path) and os.path.abspath(image_path) == os.path.abspath(mask_path))
-            except Exception:
-                same_folder = False
-            if same_folder and found_path is not None:
-                mask_name = None
+        mask_fp = _resolve_detection_mask(img_fp, slice_idx)
+        mask_name = os.path.basename(mask_fp) if mask_fp else None
 
         return jsonify(image=img_name, mask=mask_name)
     except Exception as e:

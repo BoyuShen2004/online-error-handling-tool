@@ -14,7 +14,7 @@
     {% if incorrect_layers %}
     <div class="layer-navigation">
               <div class="nav-info">
-                <span class="current-layer">Layer {{ current_layer.z + 1 if current_layer.z is defined else layer_index + 1 }} (Slice {{ current_layer.z if current_layer.z is defined else layer_index }})</span>
+                <span class="current-layer">Layer {{ current_layer.z + 1 if current_layer.z is defined else layer_index + 1 }} (Slice {{ current_layer.z + 1 if current_layer.z is defined else layer_index + 1 }})</span>
                 <span class="layer-progress">{{ layer_index + 1 }} of {{ total_incorrect }} incorrect</span>
               </div>
       <div class="nav-controls">
@@ -50,7 +50,7 @@
       <label>Slice
         <span class="slice-ctrl">
           <button type="button" id="z-dec" class="btn btn-sm" aria-label="Previous slice">−</button>
-          <input id="z" type="number" min="0" max="0" step="1" value="0" inputmode="numeric">
+          <input id="z" type="number" min="1" max="{{ total_incorrect if incorrect_layers else 1 }}" step="1" value="{{ layer_index + 1 if incorrect_layers else 1 }}" inputmode="numeric">
           <button type="button" id="z-inc" class="btn btn-sm" aria-label="Next slice">+</button>
         </span>
       </label>
@@ -105,8 +105,8 @@
           {% endif %}
         </div>
         {% endif %}
-        <div class="dim-info">
-          <strong>Current Layer:</strong> Slice {{ slice_index if slice_index is defined else 'N/A' }}
+        <div class="dim-info dim-info-wide">
+          <strong>Current Layer:</strong> Slice {{ (slice_index + 1) if slice_index is defined else 'N/A' }}
           {% if incorrect_layers %}
           ({{ layer_index + 1 }} of {{ total_incorrect }} incorrect layers)
           {% endif %}
@@ -262,9 +262,10 @@
   .dims-row {
     display: flex;
     gap: 0.5rem;
-    flex-wrap: wrap;
-    align-items: center;
+    flex-wrap: nowrap;
+    align-items: stretch;
     justify-content: center;
+    overflow-x: auto;
   }
 
   .dataset-change {
@@ -463,8 +464,17 @@
     padding: 0.5rem 0.75rem;
     border-radius: 0.375rem;
     border: 1px solid #d1d5db;
-    flex: 1;
-    min-width: 200px;
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.35rem;
+    white-space: nowrap;
+  }
+
+  .dim-info-wide {
+    flex: 2 1 0;
   }
 
   .dim-info strong {
@@ -799,7 +809,7 @@ async function gotoSlice(newZ) {
   try {
     if (dirty[0]) { await cacheCurrentSlice(); }
     z = newZ;
-    if (zInput && zInput.value != z) zInput.value = z;
+    if (zInput && zInput.value != z + 1) zInput.value = z + 1;
     await loadSlice();
   } finally { isNavigating = false; }
 }
@@ -807,7 +817,12 @@ async function gotoSlice(newZ) {
 // Add event listeners if elements exist (for 3D mode)
 if (zInc) zInc.addEventListener('click', () => gotoSlice(z + 1));
 if (zDec) zDec.addEventListener('click', () => gotoSlice(z - 1));
-if (zInput) zInput.addEventListener('change', () => gotoSlice(parseInt(zInput.value, 10)));
+if (zInput) zInput.addEventListener('change', () => {
+  const target = parseInt(zInput.value, 10);
+  if (!Number.isNaN(target)) {
+    gotoSlice(target - 1);
+  }
+});
 
 // Enhanced keyboard navigation for all modes
 window.addEventListener('keydown', (e) => {
@@ -873,7 +888,9 @@ window.gotoSlice = gotoSlice;
   const zInc = document.getElementById('z-inc');
   const zDec = document.getElementById('z-dec');
   if (zInput){
-    zInput.min = 0; zInput.max = Math.max(0, totalIncorrect - 1); zInput.value = currentLayerIndex;
+    zInput.min = 1;
+    zInput.max = Math.max(1, totalIncorrect);
+    zInput.value = currentLayerIndex + 1;
   }
   function goToIndex(idx){
     idx = Math.max(0, Math.min(totalIncorrect - 1, idx|0));
@@ -883,7 +900,12 @@ window.gotoSlice = gotoSlice;
   }
   zInc?.addEventListener('click', () => goToIndex(currentLayerIndex + 1));
   zDec?.addEventListener('click', () => goToIndex(currentLayerIndex - 1));
-  zInput?.addEventListener('change', () => goToIndex(parseInt(zInput.value, 10)));
+  zInput?.addEventListener('change', () => {
+    const target = parseInt(zInput.value, 10);
+    if (!Number.isNaN(target)) {
+      goToIndex(target - 1);
+    }
+  });
 })();
 {% endif %}
 

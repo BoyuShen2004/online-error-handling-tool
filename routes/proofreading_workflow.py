@@ -6,18 +6,146 @@ Handles the standalone proofreading workflow (similar to PFTool).
 
 import os
 import io
+import math
 import base64
 import numpy as np
 import cv2
 from flask import Blueprint, render_template, request, current_app, jsonify, send_file, redirect, url_for
 from PIL import Image
-from backend.volume_manager import load_image_or_stack, load_mask_like, save_mask, list_images_for_path, build_mask_stack_from_pairs, stack_2d_images
+from backend.volume_manager import load_image_or_stack, load_mask_like, save_mask, list_images_for_path, build_mask_stack_from_pairs, build_mask_path_mapping, stack_2d_images
+def _store_file_lists(image_files=None, mask_files=None):
+    if image_files is not None:
+        current_app.config["PROOFREADING_IMAGE_FILES"] = list(image_files)
+    if mask_files is not None:
+        current_app.config["PROOFREADING_MASK_FILES"] = list(mask_files)
+
+
+def _ensure_cached_image_files():
+    files = current_app.config.get("PROOFREADING_IMAGE_FILES")
+    if files:
+        return files
+    session_manager = current_app.session_manager
+    session_state = session_manager.snapshot()
+    image_path = session_state.get("image_path", "")
+    files = list_images_for_path(image_path)
+    current_app.config["PROOFREADING_IMAGE_FILES"] = files
+    return files
+
+
+def _resolve_mask_for_index(img_fp, idx, default_mask_path=None):
+    mask_files = current_app.config.get("PROOFREADING_MASK_FILES")
+    if mask_files and idx < len(mask_files):
+        mask_fp = mask_files[idx]
+        if mask_fp:
+            return mask_fp
+
+    def build_extensions(base_ext):
+        exts = [base_ext.lower()]
+        for e in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+            if e not in exts:
+                exts.append(e)
+        return exts
+
+    def try_dir(dir_path, base_name, extensions):
+        if not dir_path or not os.path.isdir(dir_path):
+            return None
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_mask{e}")
+            if os.path.exists(cand):
+                return cand
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_prediction{e}")
+            if os.path.exists(cand):
+                return cand
+        if base_name.endswith("_0000"):
+            trimmed = base_name[:-5]
+            for e in extensions:
+                cand = os.path.join(dir_path, f"{trimmed}{e}")
+                if os.path.exists(cand):
+                    return cand
+        return None
+
+    if not img_fp:
+        return default_mask_path
+
+    base, ext = os.path.splitext(os.path.basename(img_fp))
+    extensions = build_extensions(ext)
+    session_state = current_app.session_manager.snapshot()
+    mask_path = session_state.get("mask_path", default_mask_path)
+    search_dirs = []
+    if mask_path and os.path.isdir(mask_path):
+        search_dirs.append(mask_path)
+    img_dir = os.path.dirname(img_fp)
+    if img_dir:
+        search_dirs.append(img_dir)
+
+    for d in search_dirs:
+        result = try_dir(d, base, extensions)
+        if result:
+            return result
+
+    if mask_path and os.path.isfile(mask_path):
+        return mask_path
+    return None
+from backend.lazy_stack import LazySliceLoader, LazyMaskLoader
 from backend.utils import jsonify_dimensions
+from backend.data_manager import DataManager
 
 bp = Blueprint("proofreading_workflow", __name__, url_prefix="/standalone_proofreading")
 
 def register_proofreading_workflow_routes(app):
     app.register_blueprint(bp)
+
+
+def _infer_num_slices(volume):
+    """Best-effort slice count for numpy arrays or lazy loaders."""
+    if volume is None:
+        return 0
+    shape = getattr(volume, "shape", None)
+    if isinstance(shape, tuple) and shape:
+        if len(shape) <= 2:
+            return 1
+        return max(1, int(shape[0]))
+    try:
+        return max(1, len(volume))
+    except (TypeError, AttributeError):
+        return 1
+
+
+def _ensure_proofreading_data_manager(volume, mask):
+    """Attach or refresh a DataManager for standalone proofreading previews."""
+    data_manager = current_app.config.get("PROOFREADING_DATA_MANAGER")
+    if data_manager is None:
+        data_manager = DataManager()
+        current_app.config["PROOFREADING_DATA_MANAGER"] = data_manager
+
+    total_slices = _infer_num_slices(volume)
+    ndim_guess = getattr(volume, "ndim", 3 if total_slices > 1 else 2)
+
+    data_manager.current_volume = volume
+    data_manager.volume_info = {
+        "shape": getattr(volume, "shape", None),
+        "dtype": str(getattr(volume, "dtype", "uint8")),
+        "ndim": ndim_guess,
+        "is_3d": total_slices > 1,
+        "num_slices": total_slices,
+        "lazy": hasattr(volume, "get_slice")
+    }
+
+    data_manager.current_mask = mask
+    if mask is not None:
+        mask_shape = getattr(mask, "shape", None)
+        mask_ndim = getattr(mask, "ndim", 3 if mask_shape and len(mask_shape) >= 3 else 2)
+        data_manager.mask_info = {
+            "shape": mask_shape,
+            "dtype": str(getattr(mask, "dtype", "uint8")),
+            "ndim": mask_ndim,
+            "is_3d": mask_ndim == 3,
+            "num_slices": mask_shape[0] if mask_shape and mask_ndim == 3 else 1,
+            "lazy": hasattr(mask, "get_slice")
+        }
+
+    return data_manager, total_slices
 
 @bp.route("/load")
 def proofreading_load():
@@ -50,6 +178,9 @@ def clear_data():
         current_app.config.pop("PROOFREADING_IMAGE_PATH", None)
         current_app.config.pop("PROOFREADING_MASK_PATH", None)
         current_app.config.pop("PROOFREADING_EDITED_SLICES", None)
+        current_app.config.pop("PROOFREADING_MASK_EDITS", None)
+        current_app.config.pop("PROOFREADING_NUM_SLICES", None)
+        current_app.config.pop("PROOFREADING_DATA_MANAGER", None)
         
         # Clear session
         session_manager = current_app.session_manager
@@ -70,6 +201,8 @@ def proofreading_load_post():
         current_app.config.pop("PROOFREADING_MASK", None)
         current_app.config.pop("PROOFREADING_IMAGE_PATH", None)
         current_app.config.pop("PROOFREADING_MASK_PATH", None)
+        current_app.config.pop("PROOFREADING_NUM_SLICES", None)
+        current_app.config.pop("PROOFREADING_DATA_MANAGER", None)
         
         # Get form data
         load_mode = request.form.get("load_mode", "path")
@@ -162,37 +295,48 @@ def proofreading_load_post():
             except Exception:
                 pass
 
-        # Load volume using prepared source
-        if isinstance(prepared_image_source, list):
-            # Stack list of 2D files into a volume
-            volume = stack_2d_images(prepared_image_source)
+        # Load volume using prepared source (lazy for folders/globs/lists)
+        if is_dir_or_glob_or_list:
+            if isinstance(prepared_image_source, list):
+                image_files = list(prepared_image_source)
+            else:
+                image_files = list_images_for_path(prepared_image_source)
+            _store_file_lists(image_files=image_files)
+            volume = LazySliceLoader(image_files)
         else:
-            volume = load_image_or_stack(prepared_image_source)
+            if isinstance(prepared_image_source, list):
+                image_files = list(prepared_image_source)
+                volume = stack_2d_images(prepared_image_source)
+            else:
+                image_files = [prepared_image_source]
+                volume = load_image_or_stack(prepared_image_source)
+            _store_file_lists(image_files=image_files)
+
         # Optional: build mask per-file pairing when working with folders/globs/lists
         mask = None
         if is_dir_or_glob_or_list:
-            # Determine mask directory: same as images if mask_path is empty or is same dir
             mask_dir = None
             if mask_path and os.path.isdir(mask_path):
                 mask_dir = mask_path
             elif not mask_path:
-                mask_dir = None  # same directory as each image
+                mask_dir = None
             else:
-                # mask provided as single file; fallback to generic alignment
                 mask = load_mask_like(mask_path, volume)
 
             if mask is None:
-                # Pair using the same drivers as volume load
-                if isinstance(prepared_image_source, list):
-                    image_files = prepared_image_source
-                else:
-                    image_files = list_images_for_path(prepared_image_source)
-                mask = build_mask_stack_from_pairs(image_files, mask_dir)
+                mask_paths = build_mask_path_mapping(image_files, mask_dir)
+                _store_file_lists(mask_files=mask_paths)
+                mask = LazyMaskLoader(mask_paths, volume.slice_shape)
         else:
             mask = load_mask_like(mask_path, volume) if mask_path else None
+            if mask_path:
+                if isinstance(mask_path, list):
+                    _store_file_lists(mask_files=mask_path)
+                elif os.path.isfile(mask_path):
+                    _store_file_lists(mask_files=[mask_path])
         
-        print(f"DEBUG: Loaded volume shape: {volume.shape if volume is not None else 'None'}")
-        print(f"DEBUG: Loaded mask shape: {mask.shape if mask is not None else 'None'}")
+        print(f"DEBUG: Loaded volume shape: {getattr(volume, 'shape', None)}")
+        print(f"DEBUG: Loaded mask shape: {getattr(mask, 'shape', None)}")
         
         # Store in app config for the session
         current_app.config["PROOFREADING_VOLUME"] = volume
@@ -200,16 +344,15 @@ def proofreading_load_post():
         current_app.config["PROOFREADING_IMAGE_PATH"] = image_path
         current_app.config["PROOFREADING_MASK_PATH"] = mask_path
         current_app.config["PROOFREADING_EDITED_SLICES"] = set()
+        current_app.config["PROOFREADING_MASK_EDITS"] = {}
+        data_manager, num_slices = _ensure_proofreading_data_manager(volume, mask)
+        current_app.config["PROOFREADING_NUM_SLICES"] = num_slices
         
         # Update session with 3D info
-        mode3d = volume.ndim == 3
+        mode3d = getattr(volume, 'ndim', 2) == 3
         session_manager.update(mode3d=mode3d)
         
         print(f"DEBUG: Stored in config - volume: {current_app.config.get('PROOFREADING_VOLUME') is not None}, mask: {current_app.config.get('PROOFREADING_MASK') is not None}")
-        
-        # Determine if 3D
-        mode3d = volume.ndim == 3
-        num_slices = volume.shape[0] if mode3d else 1
         
         # Redirect to proofreading editor
         return redirect(url_for("proofreading_workflow.proofreading_editor"))
@@ -229,14 +372,16 @@ def proofreading_editor():
     
     # Ensure mask exists (create empty mask if none provided)
     if mask is None:
-        if volume.ndim == 2:
+        if hasattr(volume, 'get_slice'):
+            mask = LazyMaskLoader([None] * volume.shape[0], volume.slice_shape)
+        elif volume.ndim == 2:
             mask = np.zeros_like(volume, dtype=np.uint8)
         elif volume.ndim == 3:
             mask = np.zeros_like(volume, dtype=np.uint8)
         current_app.config["PROOFREADING_MASK"] = mask
-        print(f"DEBUG: Created empty mask with shape {mask.shape}")
+        print(f"DEBUG: Created empty mask with shape {getattr(mask, 'shape', None)}")
     
-    mode3d = volume.ndim == 3
+    mode3d = getattr(volume, 'ndim', 2) == 3
     num_slices = volume.shape[0] if mode3d else 1
     
     return render_template("proofreading_standalone.html",
@@ -278,7 +423,11 @@ def api_slice(z):
                 print("DEBUG: No volume loaded in api_slice")
                 return jsonify(error="No volume loaded"), 404
         
-        if volume.ndim == 2:
+        if hasattr(volume, 'get_slice'):
+            total = volume.shape[0]
+            z = int(np.clip(z, 0, total - 1))
+            sl = volume.get_slice(z)
+        elif volume.ndim == 2:
             sl = volume
         else:
             z = int(np.clip(z, 0, volume.shape[0] - 1))
@@ -355,7 +504,13 @@ def api_mask(z):
         if mask is None:
             return jsonify(error="No mask loaded"), 404
 
-        if mask.ndim == 2:
+        mask_edits = current_app.config.get("PROOFREADING_MASK_EDITS", {})
+        if z in mask_edits:
+            sl = mask_edits[z]
+        elif hasattr(mask, 'get_slice'):
+            z = int(np.clip(z, 0, mask.shape[0] - 1))
+            sl = mask.get_slice(z)
+        elif mask.ndim == 2:
             sl = mask
         else:
             z = int(np.clip(z, 0, mask.shape[0] - 1))
@@ -389,54 +544,63 @@ def api_names(z):
         image_path = session_state.get("image_path", "")
         mask_path = session_state.get("mask_path", "")
 
-        # Build driver list consistent with loader
-        images = list_images_for_path(image_path)
-        try:
-            img_dir = image_path if (isinstance(image_path, str) and os.path.isdir(image_path)) else None
-            mask_dir_candidate = mask_path if (mask_path and os.path.isdir(mask_path)) else img_dir
-            if img_dir and mask_dir_candidate and os.path.abspath(img_dir) == os.path.abspath(mask_dir_candidate):
-                drivers = [fp for fp in images if os.path.splitext(os.path.basename(fp))[0].endswith('_0000')]
-                if drivers:
-                    images = drivers
-        except Exception:
-            pass
+        images = current_app.config.get("PROOFREADING_IMAGE_FILES")
+        if not images:
+            images = _ensure_cached_image_files()
         if not images:
             return jsonify(image=None, mask=None)
         idx = int(np.clip(z, 0, len(images) - 1))
         img_fp = images[idx]
 
-        # Resolve mask name with both conventions
-        base, ext = os.path.splitext(os.path.basename(img_fp))
-        mdir = mask_path if (mask_path and os.path.isdir(mask_path)) else os.path.dirname(img_fp)
-
-        mask_fp = None
-        found_path = None
-        for e in [ext.lower(), ".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-            cand = os.path.join(mdir, f"{base}_mask{e}")
-            if os.path.exists(cand):
-                found_path = cand
-                mask_fp = cand
-                break
-        if mask_fp is None and base.endswith("_0000"):
-            trimmed = base[:-5]
-            for e in [ext.lower(), ".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                cand = os.path.join(mdir, f"{trimmed}{e}")
-                if os.path.exists(cand):
-                    found_path = cand
-                    mask_fp = cand
-                    break
-
-        # If same folder and a pair was found, suppress independent mask display
-        try:
-            same_folder = (mask_path and os.path.isdir(mask_path) and os.path.abspath(mask_path) == os.path.abspath(os.path.dirname(img_fp))) or \
-                          (isinstance(image_path, str) and os.path.isdir(image_path) and mask_path and os.path.isdir(mask_path) and os.path.abspath(image_path) == os.path.abspath(mask_path))
-        except Exception:
-            same_folder = False
-        mask_name = None if (same_folder and found_path is not None) else (os.path.basename(mask_fp) if mask_fp else None)
+        mask_fp = _resolve_mask_for_index(img_fp, idx, default_mask_path=mask_path)
+        mask_name = os.path.basename(mask_fp) if mask_fp else None
 
         return jsonify(image=os.path.basename(img_fp), mask=mask_name)
     except Exception as e:
         return jsonify(error=str(e)), 500
+
+
+@bp.route("/api/layers")
+def api_layers():
+    """Return paginated layer previews to avoid loading thousands of slices at once."""
+    try:
+        volume = current_app.config.get("PROOFREADING_VOLUME")
+        mask = current_app.config.get("PROOFREADING_MASK")
+        if volume is None:
+            return jsonify(success=False, error="No dataset loaded"), 404
+
+        per_page = request.args.get("per_page", 12, type=int)
+        per_page = max(1, min(per_page, 48))
+        page = request.args.get("page", 1, type=int)
+
+        data_manager, total_slices = _ensure_proofreading_data_manager(volume, mask)
+        if total_slices == 0:
+            return jsonify(success=True, layers=[], pagination={
+                "current_page": 1,
+                "total_pages": 1,
+                "per_page": per_page,
+                "total_layers": 0,
+                "start_idx": 0,
+                "end_idx": 0
+            })
+
+        total_pages = max(1, math.ceil(total_slices / per_page))
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * per_page
+        end_idx = min(start_idx + per_page, total_slices)
+
+        layers = data_manager.generate_layers_range(start_idx, end_idx)
+
+        return jsonify(success=True, layers=layers, pagination={
+            "current_page": page,
+            "total_pages": total_pages,
+            "per_page": per_page,
+            "total_layers": total_slices,
+            "start_idx": start_idx + 1,
+            "end_idx": end_idx
+        })
+    except Exception as e:
+        return jsonify(success=False, error=str(e)), 500
 
 @bp.route("/api/mask/update", methods=["POST"])
 def api_mask_update():
@@ -444,9 +608,9 @@ def api_mask_update():
     data = request.get_json(force=True)
     mask = current_app.config.get("PROOFREADING_MASK")
     volume = current_app.config.get("PROOFREADING_VOLUME")
+    mask_edits = current_app.config.setdefault("PROOFREADING_MASK_EDITS", {})
 
-    # --- ensure mask exists for 2D/3D cases ---
-    if mask is None and volume is not None:
+    if mask is None and volume is not None and not hasattr(volume, 'get_slice'):
         if volume.ndim == 2:
             mask = np.zeros_like(volume, dtype=np.uint8)
         elif volume.ndim == 3:
@@ -455,23 +619,34 @@ def api_mask_update():
     elif mask is None:
         return jsonify(success=False, error="No mask or image loaded"), 404
 
+    mask_edits = current_app.config.get("PROOFREADING_MASK_EDITS", {})
+    mask_is_lazy = hasattr(mask, "get_slice")
+
+    edited = set(current_app.config.get("PROOFREADING_EDITED_SLICES", set()))
+    mask_is_lazy = hasattr(mask, 'get_slice')
+
+    def store_edit(z_idx: int, arr: np.ndarray):
+        if mask_is_lazy:
+            mask_edits[z_idx] = arr.astype(np.uint8)
+        else:
+            if mask.ndim == 2:
+                resized = cv2.resize(arr, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask[:, :] = resized
+            else:
+                resized = cv2.resize(arr, (mask.shape[2], mask.shape[1]), interpolation=cv2.INTER_NEAREST)
+                mask[z_idx] = resized
+        edited.add(z_idx)
+
     # --- Batch updates ---
     if "full_batch" in data:
-        edited = set(current_app.config.get("PROOFREADING_EDITED_SLICES", set()))
         for item in data["full_batch"]:
             z = int(item["z"])
             png_bytes = base64.b64decode(item["png"])
             img = Image.open(io.BytesIO(png_bytes)).convert("L")
             arr = (np.array(img) > 127).astype(np.uint8)
-
-            if mask.ndim == 2:
-                arr = cv2.resize(arr, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-                mask[:, :] = arr
-            else:
-                arr = cv2.resize(arr, (mask.shape[2], mask.shape[1]), interpolation=cv2.INTER_NEAREST)
-                mask[z] = arr
-            edited.add(z)
-        current_app.config["PROOFREADING_MASK"] = mask
+            store_edit(z, arr)
+        if not mask_is_lazy:
+            current_app.config["PROOFREADING_MASK"] = mask
         current_app.config["PROOFREADING_EDITED_SLICES"] = edited
         print(f"✅ Batch updated {len(data['full_batch'])} slice(s)")
         return jsonify(success=True)
@@ -482,17 +657,9 @@ def api_mask_update():
         png_bytes = base64.b64decode(data["full_png"])
         img = Image.open(io.BytesIO(png_bytes)).convert("L")
         arr = (np.array(img) > 127).astype(np.uint8)
-
-        if mask.ndim == 2:
-            arr = cv2.resize(arr, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mask[:, :] = arr
-        else:
-            arr = cv2.resize(arr, (mask.shape[2], mask.shape[1]), interpolation=cv2.INTER_NEAREST)
-            mask[z] = arr
-
-        current_app.config["PROOFREADING_MASK"] = mask
-        edited = set(current_app.config.get("PROOFREADING_EDITED_SLICES", set()))
-        edited.add(z)
+        store_edit(z, arr)
+        if not mask_is_lazy:
+            current_app.config["PROOFREADING_MASK"] = mask
         current_app.config["PROOFREADING_EDITED_SLICES"] = edited
         print(f"✅ Replaced full slice {z}")
         return jsonify(success=True)
@@ -506,7 +673,9 @@ def api_save():
     volume = current_app.config.get("PROOFREADING_VOLUME")
 
     if mask is None and volume is not None:
-        if volume.ndim == 2:
+        if hasattr(volume, 'get_slice'):
+            mask = LazyMaskLoader([None] * volume.shape[0], volume.slice_shape)
+        elif volume.ndim == 2:
             mask = np.zeros_like(volume, dtype=np.uint8)
         elif volume.ndim == 3:
             mask = np.zeros_like(volume, dtype=np.uint8)
@@ -552,7 +721,14 @@ def api_save():
             base = os.path.splitext(os.path.basename(src_fp))[0]
             ext_out = os.path.splitext(src_fp)[-1].lower()
             out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
-            sl = mask[z] if (mask.ndim == 3 and z < mask.shape[0]) else (mask if mask.ndim == 2 else None)
+            sl = mask_edits.get(z)
+            if sl is None:
+                if mask_is_lazy:
+                    sl = mask.get_slice(z)
+                elif mask.ndim == 3 and z < mask.shape[0]:
+                    sl = mask[z]
+                elif mask.ndim == 2:
+                    sl = mask
             if sl is None:
                 continue
             save_mask(sl, out_fp)
@@ -560,6 +736,9 @@ def api_save():
         # Keep mask_path as folder
         session_manager.update(mask_path=mask_dir)
         current_app.config["PROOFREADING_MASK_PATH"] = mask_dir
+        for z in edited_list:
+            mask_edits.pop(z, None)
+        current_app.config["PROOFREADING_MASK_EDITS"] = mask_edits
         current_app.config["PROOFREADING_EDITED_SLICES"] = set()
         return jsonify(success=True, message=f"Mask slices saved to {mask_dir}")
 
@@ -619,7 +798,14 @@ def api_save():
             base = os.path.splitext(os.path.basename(src_fp))[0]
             ext_out = os.path.splitext(src_fp)[-1].lower()
             out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
-            sl = mask[z] if (mask.ndim == 3 and z < mask.shape[0]) else (mask if mask.ndim == 2 else None)
+            sl = mask_edits.get(z)
+            if sl is None:
+                if mask_is_lazy:
+                    sl = mask.get_slice(z)
+                elif mask.ndim == 3 and z < mask.shape[0]:
+                    sl = mask[z]
+                elif mask.ndim == 2:
+                    sl = mask
             if sl is None:
                 continue
             save_mask(sl, out_fp)
@@ -627,6 +813,9 @@ def api_save():
         # Update session to reference the mask directory
         session_manager.update(mask_path=mask_dir)
         current_app.config["PROOFREADING_MASK_PATH"] = mask_dir
+        for z in edited_list:
+            mask_edits.pop(z, None)
+        current_app.config["PROOFREADING_MASK_EDITS"] = mask_edits
         # Clear edited set after successful save
         current_app.config["PROOFREADING_EDITED_SLICES"] = set()
         return jsonify(success=True, message=f"Mask slices saved to {mask_dir}")
@@ -662,6 +851,7 @@ def api_save():
         
         save_mask(mask, mask_path)
         print(f"DEBUG: Save completed successfully")
+        current_app.config["PROOFREADING_MASK_EDITS"] = {}
         return jsonify(success=True, message=f"Mask saved to {mask_path}")
     except Exception as e:
         print(f"Save error: {e}")

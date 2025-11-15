@@ -7,7 +7,8 @@ Handles the error detection workflow (original functionality).
 import os
 from flask import Blueprint, render_template, request, redirect, url_for, current_app, jsonify
 from backend.data_manager import DataManager
-from backend.volume_manager import list_images_for_path, build_mask_stack_from_pairs
+from backend.volume_manager import list_images_for_path, build_mask_stack_from_pairs, build_mask_path_mapping
+from backend.lazy_stack import LazyMaskLoader
 from backend.session_manager import SessionManager
 from backend.utils import jsonify_dimensions
 
@@ -156,11 +157,25 @@ def detection_load_post():
                 pass
 
         # Load image (supports path, directory/glob, or list-of-paths); use prepared source
+        # Cache ordered image file list for later lookups
+        if is_dir_or_glob_or_list:
+            if isinstance(prepared_image_source, list):
+                cached_image_files = list(prepared_image_source)
+            else:
+                cached_image_files = list_images_for_path(prepared_image_source)
+        else:
+            if isinstance(prepared_image_source, list):
+                cached_image_files = list(prepared_image_source)
+            else:
+                cached_image_files = [prepared_image_source]
+        current_app.config["DETECTION_IMAGE_FILES"] = cached_image_files
+
         volume, volume_info = data_manager.load_image(prepared_image_source)
         
         # Load mask if provided, or pair per-file for folders/globs/lists
         mask = None
         mask_info = {}
+        lazy_volume = bool(volume_info.get("lazy"))
         if is_dir_or_glob_or_list:
             mask_dir = None
             if mask_path and os.path.isdir(mask_path):
@@ -174,21 +189,44 @@ def detection_load_post():
             if mask is None:
                 # Pair using the same driver list we used to load the volume
                 if isinstance(prepared_image_source, list):
-                    image_files = prepared_image_source
+                    image_files = list(prepared_image_source)
                 else:
                     image_files = list_images_for_path(prepared_image_source)
-                mask = build_mask_stack_from_pairs(image_files, mask_dir)
-                if mask is not None:
-                    data_manager.current_mask = mask
-                    data_manager.mask_info = {
-                        "shape": mask.shape,
-                        "dtype": str(mask.dtype),
-                        "ndim": mask.ndim,
-                        "is_3d": mask.ndim == 3,
-                        "num_slices": mask.shape[0] if mask.ndim == 3 else 1
+
+                mask_paths_for_cache = build_mask_path_mapping(image_files, mask_dir)
+                current_app.config["DETECTION_MASK_FILES"] = list(mask_paths_for_cache)
+
+                if lazy_volume:
+                    lazy_mask = LazyMaskLoader(mask_paths_for_cache, data_manager.current_volume.slice_shape)
+                    mask = lazy_mask
+                    mask_info = {
+                        "shape": lazy_mask.shape,
+                        "dtype": "uint8",
+                        "ndim": lazy_mask.ndim,
+                        "is_3d": True,
+                        "num_slices": lazy_mask.shape[0],
+                        "lazy": True
                     }
+                    data_manager.current_mask = lazy_mask
+                    data_manager.mask_info = mask_info
+                else:
+                    mask = build_mask_stack_from_pairs(image_files, mask_dir)
+                    if mask is not None:
+                        current_app.config["DETECTION_MASK_FILES"] = list(build_mask_path_mapping(image_files, mask_dir))
+                        data_manager.current_mask = mask
+                        data_manager.mask_info = {
+                            "shape": mask.shape,
+                            "dtype": str(mask.dtype),
+                            "ndim": mask.ndim,
+                            "is_3d": mask.ndim == 3,
+                            "num_slices": mask.shape[0] if mask.ndim == 3 else 1
+                        }
         elif mask_path:
             mask, mask_info = data_manager.load_mask(mask_path)
+            if isinstance(mask_path, list):
+                current_app.config["DETECTION_MASK_FILES"] = list(mask_path)
+            elif os.path.isfile(mask_path):
+                current_app.config["DETECTION_MASK_FILES"] = [mask_path]
         
         # Validate compatibility
         if not data_manager.validate_data_compatibility():
@@ -218,7 +256,7 @@ def detection_load_post():
         session_manager.set_image_info(image_path, load_mode)
         
         # Add lightweight placeholders for layers (defer overlay generation)
-        total_slices = volume.shape[0] if volume.ndim == 3 else 1
+        total_slices = volume_info.get("num_slices", 1)
         for z in range(total_slices):
             session_manager.add_layer({
                 "z": z

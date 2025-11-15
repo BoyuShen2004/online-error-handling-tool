@@ -26,8 +26,8 @@
       <div class="toolbar-group">
         <label>Slice
           <span class="slice-ctrl">
-            <button type="button" id="z-dec" class="btn btn-sm" aria-label="Previous slice">−</button>
-            <input id="z" type="number" min="0" max="{{ num_slices - 1 }}" step="1" value="0"
+          <button type="button" id="z-dec" class="btn btn-sm" aria-label="Previous slice">−</button>
+          <input id="z" type="number" min="1" max="{{ num_slices }}" step="1" value="1"
                    inputmode="numeric">
             <button type="button" id="z-inc" class="btn btn-sm" aria-label="Next slice">+</button>
           </span>
@@ -51,6 +51,24 @@
       </div>
     </div>
 
+    <div class="layer-browser" id="layer-browser">
+      <div class="layer-browser-header">
+        <div class="layer-browser-title">
+          <h3>Layer Browser</h3>
+          <p id="layer-browser-summary">Calculating page info…</p>
+        </div>
+        <div class="layer-browser-controls">
+          <button id="layer-prev-page" class="btn btn-sm btn-secondary" disabled>Previous 12</button>
+          <button id="layer-next-page" class="btn btn-sm btn-primary" disabled>Load Next 12</button>
+          <div class="page-input-group">
+            <label for="layer-page-input">Go to page</label>
+            <input type="number" id="layer-page-input" min="1" value="1">
+            <button id="layer-go-button" class="btn btn-sm btn-secondary" disabled>Go</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- File Dimensions Info -->
   <div class="dimensions-info">
     <div class="dims-row dims-top">
@@ -69,7 +87,7 @@
       </div>
       {% endif %}
       <div class="dim-info" id="slice-info">
-        <strong>Current Slice:</strong> {{ slice_index if slice_index is defined else 'N/A' }}
+        <strong>Current Slice:</strong> {{ (slice_index + 1) if slice_index is defined else 'N/A' }}
         {% if mode3d %}
         ({{ z + 1 }} of {{ num_slices }} slices)
         {% endif %}
@@ -339,6 +357,11 @@
     border: 1px solid #d1d5db;
     flex: 0 1 auto;
     min-width: 180px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.35rem;
+    white-space: nowrap;
   }
 
   .dim-info strong {
@@ -453,6 +476,56 @@
     height: calc(100vh - 250px);
     min-height: 450px;
     max-height: 650px;
+  }
+
+  .layer-browser {
+    margin: 1rem 0;
+    padding: 1rem;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.5rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+
+  .layer-browser-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: center;
+  }
+
+  .layer-browser-title h3 {
+    margin: 0;
+    color: #1e293b;
+  }
+
+  .layer-browser-title p {
+    margin: 0.25rem 0 0;
+    color: #475569;
+    font-size: 0.9rem;
+  }
+
+  .layer-browser-controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .page-input-group {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+    color: #475569;
+  }
+
+  .page-input-group input {
+    width: 80px;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid #cbd5f5;
+    border-radius: 0.375rem;
   }
 
   /* Force-hide cursor when painting/erasing */
@@ -674,14 +747,19 @@ if (is3D) {
     try {
       if (dirty[z]) { await cacheCurrentSlice(); }
       z = newZ;
-      if (zInput.value != z) zInput.value = z;
+      if (zInput.value != z + 1) zInput.value = z + 1;
       await loadSlice();
     } finally { isNavigating = false; }
   }
 
   zInc.addEventListener('click', () => gotoSlice(z + 1));
   zDec.addEventListener('click', () => gotoSlice(z - 1));
-  zInput.addEventListener('change', () => gotoSlice(parseInt(zInput.value, 10)));
+  zInput.addEventListener('change', () => {
+    const target = parseInt(zInput.value, 10);
+    if (!Number.isNaN(target)) {
+      gotoSlice(target - 1);
+    }
+  });
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;
     if (['a', 'A', 'ArrowLeft'].includes(e.key)) gotoSlice(z - 1);
@@ -695,10 +773,13 @@ function updateSliceInfo() {
   const sliceInfo = document.getElementById('slice-info');
   if (sliceInfo) {
     if (is3D) {
-      sliceInfo.innerHTML = `<strong>Current Slice:</strong> ${z} (${z + 1} of ${numSlices} slices)`;
+      sliceInfo.innerHTML = `<strong>Current Slice:</strong> ${z + 1} (of ${numSlices} slices)`;
     } else {
-      sliceInfo.innerHTML = `<strong>Current Slice:</strong> 0 (1 of 1 slice)`;
+      sliceInfo.innerHTML = `<strong>Current Slice:</strong> 1 (of 1 slice)`;
     }
+  }
+  if (window.layerPager && typeof window.layerPager.setActiveSlice === 'function') {
+    window.layerPager.setActiveSlice(is3D ? z : 0);
   }
 }
 
@@ -760,6 +841,75 @@ async function loadSlice(){
   redoStacks[z] = redoStacks[z] || [];
 }
 loadSlice();
+
+class LayerPagination {
+  constructor() {
+    this.summary = document.getElementById('layer-browser-summary');
+    this.nextBtn = document.getElementById('layer-next-page');
+    this.prevBtn = document.getElementById('layer-prev-page');
+    this.pageInput = document.getElementById('layer-page-input');
+    this.goBtn = document.getElementById('layer-go-button');
+    this.perPage = 12;
+    this.totalLayers = Math.max(1, numSlices || 1);
+    this.totalPages = Math.max(1, Math.ceil(this.totalLayers / this.perPage));
+    this.currentPage = 1;
+    this.bindEvents();
+    this.updateDisplay();
+  }
+
+  bindEvents() {
+    this.nextBtn?.addEventListener('click', () => this.loadPage(this.currentPage + 1));
+    this.prevBtn?.addEventListener('click', () => this.loadPage(this.currentPage - 1));
+    this.goBtn?.addEventListener('click', () => {
+      const target = parseInt(this.pageInput?.value || '1', 10);
+      if (!isNaN(target)) this.loadPage(target);
+    });
+  }
+
+  loadPage(page) {
+    const clamped = Math.max(1, Math.min(page, this.totalPages));
+    if (clamped === this.currentPage) return;
+    this.currentPage = clamped;
+    const targetZ = Math.min(this.totalLayers - 1, (clamped - 1) * this.perPage);
+    if (typeof window.gotoSlice === 'function') {
+      window.gotoSlice(targetZ);
+    }
+    this.updateDisplay();
+  }
+
+  setActiveSlice(activeZ) {
+    const derivedPage = Math.floor(activeZ / this.perPage) + 1;
+    if (derivedPage !== this.currentPage) {
+      this.currentPage = derivedPage;
+    }
+    this.updateDisplay();
+  }
+
+  updateDisplay() {
+    if (this.pageInput) {
+      this.pageInput.max = String(this.totalPages);
+      this.pageInput.value = String(this.currentPage);
+    }
+    if (this.summary) {
+      const start = this.totalLayers === 0 ? 0 : ((this.currentPage - 1) * this.perPage) + 1;
+      const end = Math.min(this.totalLayers, start + this.perPage - 1);
+      this.summary.textContent = `Showing layers ${start}–${end} of ${this.totalLayers}`;
+    }
+    if (this.prevBtn) this.prevBtn.disabled = this.currentPage <= 1;
+    if (this.nextBtn) this.nextBtn.disabled = this.currentPage >= this.totalPages;
+    if (this.goBtn) this.goBtn.disabled = this.totalPages <= 1;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const browser = document.getElementById('layer-browser');
+  if (!browser) return;
+  if (is3D) {
+    window.layerPager = new LayerPagination();
+  } else {
+    browser.style.display = 'none';
+  }
+});
 
 /* ---- Painting + History ---- */
 base.onmousedown = e => { 

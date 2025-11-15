@@ -65,7 +65,7 @@
     {% for layer in layers %}
     <div class="layer-card {{ layer.status or 'unlabeled' }}" data-layer-id="{{ layer.id }}" data-status="{{ layer.status or 'unlabeled' }}" data-z="{{ layer.z }}">
       <div class="layer-header">
-        <h4>Layer {{ pagination.start_idx + loop.index - 1 }} {% if mode3d %}(Z: {{ layer.z }}){% endif %}</h4>
+        <h4>Layer {{ pagination.start_idx + loop.index - 1 }}</h4>
         <div class="layer-status">
           <span class="status-indicator {{ layer.status or 'unlabeled' }}"></span>
           <span class="status-text">{{ (layer.status or 'unlabeled').title() }}</span>
