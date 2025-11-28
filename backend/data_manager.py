@@ -8,12 +8,9 @@ import numpy as np
 import tifffile
 from PIL import Image
 
-<<<<<<< HEAD
 from backend.lazy_stack import LazySliceLoader, LazyMaskLoader
 from backend.volume_manager import list_images_for_path, build_mask_path_mapping
 
-=======
->>>>>>> 3f56e9f990b99809b40b97f25513b326deedeb57
 
 def _ensure_grayscale_2d(arr: np.ndarray, kind: str) -> np.ndarray:
     """
@@ -82,6 +79,108 @@ def _mask_to_reference_scale(mask: Optional[np.ndarray], reference: np.ndarray) 
     else:
         # Fallback to uint8 if dtype is unexpected
         return (mask_bool.astype(np.uint8)) * 255
+
+
+def _enhance_contrast(arr: np.ndarray) -> np.ndarray:
+    """
+    Apply contrast enhancement to improve visibility of dark images.
+    Uses CLAHE (Contrast Limited Adaptive Histogram Equalization).
+    """
+    if arr.ndim != 2:
+        return arr
+    
+    # Normalize to uint8 if needed
+    if arr.max() > 255 or arr.dtype != np.uint8:
+        if arr.max() > 0:
+            arr = (arr / arr.max() * 255.0).astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8)
+    
+    # Apply CLAHE for contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(arr)
+
+
+def _normalize_image_slice_to_rgb(arr: np.ndarray) -> np.ndarray:
+    """
+    Normalize image slice to RGB format with CLAHE enhancement.
+    Used by both integrated and standalone proofreading.
+    
+    Args:
+        arr: Input image slice (2D or 3D with channels)
+        
+    Returns:
+        RGB image as uint8 array of shape (H, W, 3)
+    """
+    arr = np.asarray(arr)
+    
+    # If already RGB, just ensure uint8
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        return arr.astype(np.uint8)
+    
+    # Normalize to 0-255 range
+    if arr.max() > 0:
+        arr = (arr / arr.max() * 255.0)
+    else:
+        arr = arr.astype(np.float64)
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    
+    # Apply CLAHE for contrast enhancement (only for 2D)
+    if arr.ndim == 2:
+        arr = _enhance_contrast(arr)
+    
+    # Convert to RGB by stacking channels
+    rgb = np.stack([arr] * 3, axis=-1)
+    
+    # Ensure consistent data type and range
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _mask_slice_to_rgba(mask_slice: np.ndarray, opacity: int = 230) -> np.ndarray:
+    """
+    Convert mask slice to RGBA format with grayscale overlay.
+    Used by both integrated and standalone proofreading.
+    
+    Args:
+        mask_slice: Input mask slice (2D array)
+        opacity: Alpha channel value (0-255), default 230 (90% opacity)
+        
+    Returns:
+        RGBA image as uint8 array of shape (H, W, 4)
+    """
+    sl = np.asarray(mask_slice)
+    
+    # Convert mask to uint8 without normalization (preserve original values)
+    if sl.dtype != np.uint8:
+        if sl.max() <= 1.0 and sl.min() >= 0.0:
+            mask_uint8 = (sl * 255).astype(np.uint8)
+        elif sl.max() > 255:
+            mask_uint8 = ((sl.astype(np.float32) / sl.max()) * 255).astype(np.uint8) if sl.max() > 0 else sl.astype(np.uint8)
+        else:
+            mask_uint8 = np.clip(sl, 0, 255).astype(np.uint8)
+    else:
+        mask_uint8 = sl.copy()
+    
+    # Create RGBA: grayscale mask with transparency
+    h, w = mask_uint8.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    
+    # Binary check: any non-zero value means mask pixel
+    mask_binary = mask_uint8 > 0
+    
+    # Debug: check if we're losing mask data
+    if np.count_nonzero(mask_binary) == 0 and np.count_nonzero(mask_uint8) > 0:
+        # Try a more lenient threshold
+        mask_binary = mask_uint8 >= 1
+    
+    # Set white color with transparency where mask exists
+    rgba[mask_binary, 0] = 255  # R
+    rgba[mask_binary, 1] = 255  # G
+    rgba[mask_binary, 2] = 255  # B
+    rgba[mask_binary, 3] = opacity  # A
+    
+    return rgba
+    return clahe.apply(arr)
 
 class DataManager:
     """
@@ -282,6 +381,9 @@ class DataManager:
         
         img_norm = np.clip(img_norm, 0, 255).astype(np.uint8)
         
+        # Apply contrast enhancement for better visibility of dark images
+        img_norm = _enhance_contrast(img_norm)
+        
         # Convert to RGB
         img_rgb = np.stack([img_norm] * 3, axis=-1)
 
@@ -321,6 +423,15 @@ class DataManager:
         """
         overlay = self.create_overlay(image_slice, mask_slice)
         
+        # Prepare enhanced image slice for display
+        enhanced_image = _ensure_grayscale_2d(image_slice, "image slice")
+        if enhanced_image.max() > 1:
+            enhanced_image = enhanced_image.astype(np.float32)
+        else:
+            enhanced_image = (enhanced_image * 255).astype(np.float32)
+        enhanced_image = np.clip(enhanced_image, 0, 255).astype(np.uint8)
+        enhanced_image = _enhance_contrast(enhanced_image)
+        
         mask_serialized = None
         if mask_slice is not None:
             mask_for_serialization = _mask_to_reference_scale(mask_slice, image_slice)
@@ -328,7 +439,7 @@ class DataManager:
 
         return {
             "z": z,
-            "image_slice": self.array_to_base64(image_slice),
+            "image_slice": self.array_to_base64(enhanced_image),
             "mask_slice": mask_serialized,
             "overlay": self.array_to_base64(overlay),
             "has_mask": mask_slice is not None,

@@ -88,17 +88,94 @@ class LazyMaskLoader:
                 arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
         else:
             arr = np.asarray(tifffile.imread(path))
-            if arr.ndim > 2:
+            print(f"DEBUG: LazyMaskLoader - Raw TIF {os.path.basename(path)}: shape={arr.shape}, dtype={arr.dtype}, min={arr.min()}, max={arr.max()}, non-zero={np.count_nonzero(arr)}")
+            
+            # Handle different TIF formats
+            if arr.ndim == 2:
+                # Already 2D, use as-is
+                pass
+            elif arr.ndim == 3:
+                # Could be (Z, H, W) stack or (H, W, C) multi-channel
+                # For masks, if last dimension is small (1-4), it's likely channels
+                if arr.shape[2] <= 4:
+                    # Likely (H, W, C) - take first channel
+                    arr = arr[:, :, 0]
+                    print(f"DEBUG: Took first channel, new shape: {arr.shape}")
+                else:
+                    # Likely (Z, H, W) stack - take first slice
+                    arr = arr[0]
+                    print(f"DEBUG: Took first slice, new shape: {arr.shape}")
+            elif arr.ndim > 3:
+                # 4D or higher - take first slice
                 arr = arr[0]
-        arr = _to_uint8(arr)
-        return (arr > 0).astype(np.uint8)
+                print(f"DEBUG: Took first slice from 4D+, new shape: {arr.shape}")
+            else:
+                raise ValueError(f"Unsupported mask array dimensions: {arr.ndim} for {path}")
+        
+        # Debug: print raw mask info
+        print(f"DEBUG: LazyMaskLoader - Loaded {os.path.basename(path)}, shape: {arr.shape}, dtype: {arr.dtype}, min: {arr.min()}, max: {arr.max()}, non-zero: {np.count_nonzero(arr)}")
+        
+        # Store original for comparison
+        original_nonzero = np.count_nonzero(arr)
+        original_max = arr.max()
+        
+        # Convert to uint8, preserving mask values (don't normalize)
+        # IMPORTANT: For binary masks, we want to preserve any non-zero value as 255
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0 and arr.min() >= 0.0:
+                # Float 0-1 range, scale to 0-255
+                arr = (arr * 255).astype(np.uint8)
+            elif arr.max() > 255:
+                # Large values (uint16), scale proportionally
+                if arr.max() > 0:
+                    arr = ((arr.astype(np.float32) / arr.max()) * 255).astype(np.uint8)
+                else:
+                    arr = arr.astype(np.uint8)
+            else:
+                # For integer types with values <= 255, preserve non-zero values
+                # If it's a binary mask (0 and 1), convert 1 to 255
+                unique_vals = np.unique(arr)
+                if len(unique_vals) == 2 and 0 in unique_vals and 1 in unique_vals:
+                    # Binary mask: convert 1 to 255
+                    arr = (arr * 255).astype(np.uint8)
+                    print(f"DEBUG: Detected binary mask (0,1), converted to (0,255)")
+                elif len(unique_vals) == 2 and 0 in unique_vals:
+                    # Binary mask with 0 and some other value - convert non-zero to 255
+                    arr = (arr > 0).astype(np.uint8) * 255
+                    print(f"DEBUG: Detected binary mask with 0 and {unique_vals[unique_vals != 0][0]}, converted to (0,255)")
+                else:
+                    # Just clip to uint8 range
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+        
+        print(f"DEBUG: LazyMaskLoader - After conversion, shape: {arr.shape}, dtype: {arr.dtype}, min: {arr.min()}, max: {arr.max()}, non-zero: {np.count_nonzero(arr)}")
+        
+        # Check if we lost mask data during conversion
+        final_nonzero = np.count_nonzero(arr)
+        if original_nonzero > 0 and final_nonzero == 0:
+            print(f"ERROR: Mask data lost during conversion! Original had {original_nonzero} non-zero pixels, final has 0")
+            print(f"  Original max value: {original_max}, dtype: {arr.dtype}")
+            # Try to recover: if original had non-zero, make them 255
+            # This shouldn't happen, but if it does, we'll try to fix it
+        elif arr.max() == 0:
+            print(f"WARNING: Mask {os.path.basename(path)} appears to be empty (all zeros)")
+        
+        return arr
 
     def get_slice(self, index: int) -> np.ndarray:
         idx = max(0, min(index, self._num_slices - 1))
         path = self.mask_paths[idx]
         if not path:
+            print(f"WARNING: No mask path for index {idx}")
             return np.zeros(self.slice_shape, dtype=np.uint8)
+        
+        if not os.path.exists(path):
+            print(f"ERROR: Mask file does not exist: {path}")
+            return np.zeros(self.slice_shape, dtype=np.uint8)
+        
         mask_arr = self._load_mask_slice(path)
         mask_arr = _resize_if_needed(mask_arr, self.slice_shape)
-        return (mask_arr > 0).astype(np.uint8)
+        
+        print(f"DEBUG: LazyMaskLoader.get_slice({idx}) returning shape: {mask_arr.shape}, dtype: {mask_arr.dtype}, min: {mask_arr.min()}, max: {mask_arr.max()}, non-zero: {np.count_nonzero(mask_arr)}")
+        
+        return mask_arr
 

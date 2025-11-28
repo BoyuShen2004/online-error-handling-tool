@@ -11,6 +11,7 @@ import numpy as np
 from flask import Blueprint, render_template, request, current_app, jsonify, send_file, redirect, url_for
 from PIL import Image
 from backend.volume_manager import list_images_for_path, load_image_or_stack, load_mask_like, save_mask, stack_2d_images
+from backend.data_manager import _normalize_image_slice_to_rgb, _mask_slice_to_rgba
 def _cached_detection_image_files():
     files = current_app.config.get("DETECTION_IMAGE_FILES")
     if files:
@@ -40,10 +41,22 @@ def _resolve_detection_mask(img_fp, idx):
     def try_dir(dir_path, base_name, extensions):
         if not dir_path or not os.path.isdir(dir_path):
             return None
+        # Try _mask suffix
         for e in extensions:
             cand = os.path.join(dir_path, f"{base_name}_mask{e}")
             if os.path.exists(cand):
                 return cand
+        # Try _pred_skeleton suffix (for files like Image95_00001_pred_skeleton.tif)
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_pred_skeleton{e}")
+            if os.path.exists(cand):
+                return cand
+        # Try _pred suffix (for files like Image94_00001_pred.tif)
+        for e in extensions:
+            cand = os.path.join(dir_path, f"{base_name}_pred{e}")
+            if os.path.exists(cand):
+                return cand
+        # Try _prediction suffix
         for e in extensions:
             cand = os.path.join(dir_path, f"{base_name}_prediction{e}")
             if os.path.exists(cand):
@@ -370,18 +383,20 @@ def api_slice(slice_idx):
         if slice_idx != 0:
             return jsonify({"error": "Only slice 0 available for incorrect layer editing"}), 400
         
+        # Convert to RGB with consistent normalization (using shared helper)
+        rgb = _normalize_image_slice_to_rgb(volume)
+        
         # Convert to PIL Image and return as PNG
         from PIL import Image
-        img = Image.fromarray(volume)
-        
-        # Convert to bytes
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        
-        return send_file(img_bytes, mimetype='image/png')
+        bio = io.BytesIO()
+        Image.fromarray(rgb).save(bio, format="PNG")
+        bio.seek(0)
+        return send_file(bio, mimetype="image/png")
         
     except Exception as e:
+        print(f"DEBUG: Error in api_slice: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @bp.route("/api/mask/<int:slice_idx>")
@@ -397,18 +412,26 @@ def api_mask(slice_idx):
         if slice_idx != 0:
             return jsonify({"error": "Only slice 0 available for incorrect layer editing"}), 400
         
+        # Get mask slice (already a single slice for integrated)
+        sl = np.asarray(mask)
+        
+        print(f"DEBUG: Processing mask slice shape: {sl.shape}")
+        print(f"DEBUG: Mask slice dtype: {sl.dtype}, min: {sl.min()}, max: {sl.max()}, non-zero: {np.count_nonzero(sl)}")
+        
+        # Convert mask to RGBA using shared helper
+        rgba = _mask_slice_to_rgba(sl, opacity=230)
+        
         # Convert to PIL Image and return as PNG
         from PIL import Image
-        img = Image.fromarray(mask * 255)
-        
-        # Convert to bytes
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        
-        return send_file(img_bytes, mimetype='image/png')
+        bio = io.BytesIO()
+        Image.fromarray(rgba).save(bio, format="PNG")
+        bio.seek(0)
+        return send_file(bio, mimetype="image/png")
         
     except Exception as e:
+        print(f"DEBUG: Error in api_mask: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @bp.route("/api/names_current")
@@ -435,40 +458,63 @@ def api_names_current():
 
 @bp.route("/api/mask/update", methods=["POST"])
 def api_mask_update():
-    """Update mask with edited slices."""
+    """Update mask with edited slices (matching standalone logic)."""
     try:
-        data = request.get_json()
-        batch = data.get("full_batch", [])
-        
-        if not batch:
-            return jsonify({"success": True, "message": "No changes to save"})
-        
-        # Get current mask (single slice for incorrect layer editing)
+        data = request.get_json(force=True)
         mask = current_app.config.get("INTEGRATED_MASK")
-        if mask is None:
-            return jsonify({"success": False, "error": "Mask not loaded"}), 400
+        volume = current_app.config.get("INTEGRATED_VOLUME")
         
-        # Update mask with edited slice (only slice 0 for incorrect layer editing)
-        for item in batch:
-            slice_idx = item.get("z", 0)
-            png_data = item.get("png", "")
-            
-            if png_data and slice_idx == 0:  # Only allow slice 0 for incorrect layer editing
-                # Decode base64 PNG data
-                import base64
-                img_data = base64.b64decode(png_data)
-                img = Image.open(io.BytesIO(img_data))
-                img_array = np.array(img.convert('L')) > 128
-                
-                # Update the single slice mask
-                mask[:] = img_array.astype(np.uint8)
+        if mask is None and volume is not None:
+            if volume.ndim == 2:
+                mask = np.zeros_like(volume, dtype=np.uint8)
+            elif volume.ndim == 3:
+                mask = np.zeros_like(volume, dtype=np.uint8)
+            current_app.config["INTEGRATED_MASK"] = mask
+        elif mask is None:
+            return jsonify(success=False, error="No mask or image loaded"), 404
         
-        # Update mask in app config
-        current_app.config["INTEGRATED_MASK"] = mask
+        # For integrated proofreading, we only work with slice 0
+        def store_edit(arr: np.ndarray):
+            # Resize if needed to match mask dimensions
+            if arr.shape != mask.shape:
+                import cv2
+                resized = cv2.resize(arr, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask[:] = resized
+            else:
+                mask[:] = arr.astype(np.uint8)
+            current_app.config["INTEGRATED_MASK"] = mask
         
-        return jsonify({"success": True})
+        # --- Batch updates ---
+        if "full_batch" in data:
+            for item in data["full_batch"]:
+                z = int(item.get("z", 0))
+                if z != 0:
+                    continue  # Only allow slice 0 for integrated proofreading
+                png_bytes = base64.b64decode(item["png"])
+                img = Image.open(io.BytesIO(png_bytes)).convert("L")
+                arr = (np.array(img) > 127).astype(np.uint8)
+                store_edit(arr)
+            print(f"✅ Batch updated slice(s)")
+            return jsonify(success=True)
+        
+        # --- Single slice update ---
+        if "full_png" in data:
+            z = int(data.get("z", 0))
+            if z != 0:
+                return jsonify(success=False, error="Only slice 0 available for incorrect layer editing"), 400
+            png_bytes = base64.b64decode(data["full_png"])
+            img = Image.open(io.BytesIO(png_bytes)).convert("L")
+            arr = (np.array(img) > 127).astype(np.uint8)
+            store_edit(arr)
+            print(f"✅ Replaced full slice {z}")
+            return jsonify(success=True)
+        
+        return jsonify(success=False, error="Invalid data"), 400
         
     except Exception as e:
+        print(f"DEBUG: Error in api_mask_update: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route("/api/save", methods=["POST"])
@@ -536,7 +582,8 @@ def api_save():
                 ext_out = os.path.splitext(src_fp)[-1].lower()
                 out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
 
-            save_mask(mask, out_fp)
+            # Use format preservation if saving to original file
+            save_mask(mask, out_fp, preserve_format_from=out_fp if os.path.exists(out_fp) else None)
             return jsonify({"success": True, "message": f"Mask slice saved to {out_fp}"})
 
         # Case B: no mask folder → create sibling folder and save current slice
@@ -596,17 +643,23 @@ def api_save():
             return jsonify({"success": True, "message": f"Mask slice saved to {out_fp}"})
 
         # Generate mask path if not provided (file-based)
+        # Only create _uploads folder for actual uploads, not when reading from file paths
         if not mask_path:
-            if load_mode == "upload" or not image_path or not os.path.exists(image_path):
+            if load_mode == "upload":
                 base_dir = os.path.abspath("./_uploads")
                 os.makedirs(base_dir, exist_ok=True)
                 image_name = session_state.get("image_name", "image")
                 if not image_name or image_name == "image":
                     image_name = "image"
                 original_base = os.path.splitext(os.path.basename(image_name))[0]
-            else:
+            elif image_path and os.path.exists(image_path):
+                # Use existing file path - don't create _uploads
                 base_dir = os.path.dirname(image_path)
                 original_base = os.path.splitext(os.path.basename(image_path))[0]
+            else:
+                # Fallback: if path doesn't exist and not upload, use current directory
+                base_dir = os.path.abspath(".")
+                original_base = "image"
 
             # Detect extension
             ext = ".tif"
@@ -615,7 +668,52 @@ def api_save():
                 if src_ext in [".png", ".jpg", ".jpeg"]:
                     ext = src_ext
 
-            mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
+            # For file paths (not uploads), try to find original mask file first
+            # Only create new mask file if no original exists
+            if load_mode == "path" and image_path and os.path.exists(image_path):
+                # If mask_path is already a file, use it
+                if mask_path and os.path.isfile(mask_path):
+                    print(f"DEBUG: Using existing mask file from session: {mask_path}")
+                else:
+                    # Try to find original mask file using naming patterns
+                    base, _ = os.path.splitext(os.path.basename(image_path))
+                    img_dir = os.path.dirname(image_path)
+                    found_original = False
+                    
+                    # Try common mask naming patterns in order of preference
+                    for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
+                        candidate = os.path.join(img_dir, f"{base}{suffix}{ext}")
+                        if os.path.exists(candidate):
+                            mask_path = candidate
+                            found_original = True
+                            print(f"DEBUG: Found original mask file: {mask_path}")
+                            break
+                    
+                    # If not found, also check parent directory for prediction folders
+                    if not found_original and img_dir:
+                        parent_dir = os.path.dirname(img_dir)
+                        dir_name = os.path.basename(img_dir)
+                        for pred_dir_name in [f"{dir_name}_predictions", f"{dir_name}_pred"]:
+                            pred_dir = os.path.join(parent_dir, pred_dir_name)
+                            if os.path.isdir(pred_dir):
+                                for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
+                                    candidate = os.path.join(pred_dir, f"{base}{suffix}{ext}")
+                                    if os.path.exists(candidate):
+                                        mask_path = candidate
+                                        found_original = True
+                                        print(f"DEBUG: Found original mask file in prediction folder: {mask_path}")
+                                        break
+                                if found_original:
+                                    break
+                    
+                    # Only create new file if no original found
+                    if not found_original:
+                        mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
+                        print(f"DEBUG: No original mask found, will create new file: {mask_path}")
+            elif not mask_path:
+                # For uploads or fallback cases, create new mask file
+                mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
+            
             session_manager.update(mask_path=mask_path)
         
         try:
@@ -630,12 +728,23 @@ def api_save():
                 elif full_mask.ndim == 2:
                     full_mask[:] = mask
                 
-                # Save the updated full mask
-                save_mask(full_mask, mask_path)
+                # Save the updated full mask with format preservation (matching standalone)
+                save_mask(full_mask, mask_path, preserve_format_from=mask_path if os.path.exists(mask_path) else None)
+                
+                # Also update the detection workflow's mask if it exists
+                detection_mask = current_app.config.get("DETECTION_MASK")
+                if detection_mask is not None:
+                    if detection_mask.ndim == 3 and slice_idx < detection_mask.shape[0]:
+                        detection_mask[slice_idx] = mask
+                    elif detection_mask.ndim == 2:
+                        detection_mask[:] = mask
+                    current_app.config["DETECTION_MASK"] = detection_mask
+                
                 return jsonify({"success": True, "message": f"Mask slice {slice_idx} saved to {mask_path}"})
             else:
                 # If no existing mask, create one with the edited slice
-                save_mask(mask, mask_path)
+                # Use format preservation if saving to an existing file
+                save_mask(mask, mask_path, preserve_format_from=mask_path if os.path.exists(mask_path) else None)
                 return jsonify({"success": True, "message": f"New mask saved to {mask_path}"})
                 
         except Exception as e:
