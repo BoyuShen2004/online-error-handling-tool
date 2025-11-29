@@ -8,12 +8,53 @@ import os
 import io
 import math
 import base64
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import cv2
 from flask import Blueprint, render_template, request, current_app, jsonify, send_file, redirect, url_for
 from PIL import Image
 from backend.volume_manager import load_image_or_stack, load_mask_like, save_mask, list_images_for_path, build_mask_stack_from_pairs, build_mask_path_mapping, stack_2d_images
 from backend.data_manager import _prepare_mask_for_display, _normalize_image_slice_to_rgb, _mask_slice_to_rgba
+
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _uploads_root() -> str:
+    env_dir = os.environ.get("PROOFREADING_UPLOAD_DIR")
+    if env_dir:
+        base_dir = os.path.abspath(env_dir)
+    else:
+        base_dir = os.path.join(os.path.expanduser("~"), "proofreading_uploads")
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
+def _saved_masks_root() -> str:
+    path = os.path.join(PROJECT_ROOT, "_saved_masks")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _saved_masks_dir_for(image_path) -> str:
+    candidate = None
+    if isinstance(image_path, list) and image_path:
+        candidate = image_path[0]
+    elif isinstance(image_path, str):
+        candidate = image_path
+
+    base_name = "dataset"
+    if isinstance(candidate, str) and candidate:
+        norm = os.path.abspath(candidate)
+        if os.path.isdir(norm):
+            base_name = os.path.basename(norm)
+        else:
+            base_name = os.path.splitext(os.path.basename(norm))[0]
+
+    target = os.path.join(_saved_masks_root(), base_name)
+    os.makedirs(target, exist_ok=True)
+    return target
 def _store_file_lists(image_files=None, mask_files=None):
     if image_files is not None:
         current_app.config["PROOFREADING_IMAGE_FILES"] = list(image_files)
@@ -171,6 +212,52 @@ def _ensure_proofreading_data_manager(volume, mask):
 
     return data_manager, total_slices
 
+
+def _apply_pending_mask_edits(mask_array: Optional[np.ndarray], mask_edits: Dict[int, np.ndarray]):
+    """
+    Merge pending edits (stored in PROOFREADING_MASK_EDITS) into the in-memory mask array.
+    Returns (mask_array, edits_applied_flag).
+    """
+    if mask_array is None or not isinstance(mask_array, np.ndarray) or not mask_edits:
+        return mask_array, False
+
+    def _resize_patch(patch: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        if patch.shape == target_shape:
+            return patch
+        return cv2.resize(patch, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    applied = False
+    if mask_array.ndim == 2:
+        patch = None
+        if 0 in mask_edits:
+            patch = mask_edits[0]
+        elif mask_edits:
+            patch = next(iter(mask_edits.values()))
+        if patch is not None:
+            patch = np.asarray(patch, dtype=np.uint8)
+            patch = _resize_patch(patch, mask_array.shape)
+            mask_array[:, :] = patch
+            applied = True
+    else:
+        depth = mask_array.shape[0]
+        for idx, sl in mask_edits.items():
+            if sl is None or idx is None or idx < 0 or idx >= depth:
+                continue
+            patch = np.asarray(sl, dtype=np.uint8)
+            patch = _resize_patch(patch, mask_array[idx].shape)
+            mask_array[idx] = patch
+            applied = True
+
+    return mask_array, applied
+
+
+def _ensure_mask_matches_volume(mask_array: Optional[np.ndarray], volume) -> Optional[np.ndarray]:
+    if isinstance(mask_array, np.ndarray):
+        vol_ndim = getattr(volume, "ndim", None)
+        if mask_array.ndim == 3 and mask_array.shape[0] == 1 and vol_ndim == 2:
+            return np.squeeze(mask_array, axis=0)
+    return mask_array
+
 @bp.route("/load")
 def proofreading_load():
     """Load dataset for standalone proofreading workflow."""
@@ -262,9 +349,8 @@ def proofreading_load_post():
                 return render_template("proofreading_load.html", 
                                     error="At least one image file is required")
 
-            # Save uploaded files temporarily
-            upload_dir = "_uploads"
-            os.makedirs(upload_dir, exist_ok=True)
+            # Save uploaded files temporarily outside repo
+            upload_dir = _uploads_root()
 
             saved_image_paths = []
             for f in image_files:
@@ -719,229 +805,146 @@ def api_save():
         mask_path = session_state.get("mask_path", "")
         load_mode = session_state.get("load_mode", "path")
 
-        # Generate save destination
-        # If the dataset came from a folder/glob/multiple files, save per-slice masks into a sibling "<dir>_mask" folder
+        # Generate save destination metadata
         src_is_dir = bool(img_path and isinstance(img_path, str) and os.path.isdir(img_path))
         src_is_glob = bool(img_path and isinstance(img_path, str) and any(ch in img_path for ch in ['*','?','[']) and not os.path.exists(img_path))
         src_is_list = isinstance(img_path, list)
+        cached_image_files = current_app.config.get("PROOFREADING_IMAGE_FILES") or []
+        cached_has_multiple = len(cached_image_files) > 1
+        dataset_has_multiple_sources = src_is_dir or src_is_glob or src_is_list or cached_has_multiple
 
-        # Folder/glob/list datasets: always save per-slice files inside mask folder
-        # Case A: a mask folder was provided by user
-        if (src_is_dir or src_is_glob or src_is_list) and mask_path and os.path.isdir(mask_path):
-            mask_dir = mask_path
-            os.makedirs(mask_dir, exist_ok=True)
-
-            # Only save edited slice(s)
-            edited = current_app.config.get("PROOFREADING_EDITED_SLICES", set())
-            edited_list = sorted(list(edited))
-            if not edited_list:
-                return jsonify(success=True, message="No edited slices to save"), 200
-
-            # Build source file list for naming
-            image_path = session_state.get("image_path", "")
-            image_files = list_images_for_path(image_path)
-            if not image_files:
-                return jsonify(success=False, error="No source files found to derive mask names"), 400
-
-            # Get original mask file paths if available
-            mask_files = current_app.config.get("PROOFREADING_MASK_FILES", [])
-            
-            for z in edited_list:
-                if z < 0:
-                    continue
-                src_fp = image_files[z if z < len(image_files) else -1]
-                base = os.path.splitext(os.path.basename(src_fp))[0]
-                ext_out = os.path.splitext(src_fp)[-1].lower()
-                
-                # Try to use original mask file path if it exists
-                out_fp = None
-                if mask_files and z < len(mask_files) and mask_files[z]:
-                    # Use the original mask file path
-                    out_fp = mask_files[z]
-                    print(f"DEBUG: Saving to original mask file: {out_fp}")
-                else:
-                    # Fallback: try to find the original mask file by matching naming patterns
-                    # Try _pred_skeleton, _pred, _prediction, _mask in that order
-                    for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
-                        candidate = os.path.join(mask_dir, f"{base}{suffix}{ext_out}")
-                        if os.path.exists(candidate):
-                            out_fp = candidate
-                            print(f"DEBUG: Found original mask file: {out_fp}")
-                            break
-                    
-                    # If still not found, use _mask suffix as fallback
-                    if out_fp is None:
-                        out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
-                        print(f"DEBUG: Using new mask file (original not found): {out_fp}")
-                
-                sl = mask_edits.get(z)
-                if sl is None:
-                    # No edits for this slice - if saving to original file, preserve it by not saving
-                    if os.path.exists(out_fp):
-                        # File already exists and hasn't been edited - skip save to preserve original format
-                        print(f"DEBUG: Slice {z} not edited, skipping save to preserve original file: {out_fp}")
-                        continue
-                    else:
-                        # New file - load from mask
-                        if mask_is_lazy:
-                            sl = mask.get_slice(z)
-                        elif mask.ndim == 3 and z < mask.shape[0]:
-                            sl = mask[z]
-                        elif mask.ndim == 2:
-                            sl = mask
-                if sl is None:
-                    continue
-                # Save preserving original format if saving to original file
-                try:
-                    save_mask(sl, out_fp, preserve_format_from=out_fp if os.path.exists(out_fp) else None)
-                except Exception as slice_save_err:
-                    print(f"ERROR saving slice {z} to {out_fp}: {slice_save_err}")
-                    import traceback
-                    traceback.print_exc()
-                    # Re-raise to be caught by outer handler
-                    raise
-
-            # Keep mask_path as folder
-            session_manager.update(mask_path=mask_dir)
-            current_app.config["PROOFREADING_MASK_PATH"] = mask_dir
-            for z in edited_list:
-                mask_edits.pop(z, None)
-            current_app.config["PROOFREADING_MASK_EDITS"] = mask_edits
-            current_app.config["PROOFREADING_EDITED_SLICES"] = set()
-            return jsonify(success=True, message=f"Mask slices saved to {mask_dir}")
-
-        # Case B: user didn't supply a mask folder; create sibling folder
-        if (src_is_dir or src_is_glob or src_is_list) and not mask_path:
-            # Build ordered source file list consistent with loader
-            def list_source_files():
-                if src_is_list:
-                    return list(img_path)
-                if src_is_dir:
-                    chosen = []
-                    for ext in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                        chosen = sorted([
-                            os.path.join(img_path, f)
-                            for f in os.listdir(img_path)
-                            if f.lower().endswith(ext)
-                        ])
-                        if chosen:
-                            break
-                    return chosen
-                # glob string
+        def _resolve_source_files():
+            if cached_image_files:
+                return cached_image_files
+            if src_is_list and isinstance(img_path, list):
+                return list(img_path)
+            if src_is_dir and isinstance(img_path, str):
+                selected = []
+                for ext in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+                    selected = sorted([
+                        os.path.join(img_path, f)
+                        for f in os.listdir(img_path)
+                        if f.lower().endswith(ext)
+                    ])
+                    if selected:
+                        break
+                return selected
+            if src_is_glob and isinstance(img_path, str):
                 import glob as _glob
                 return sorted(_glob.glob(img_path))
+            if isinstance(img_path, str) and img_path:
+                return [img_path]
+            return []
 
-            src_files = list_source_files()
-            if not src_files:
-                return jsonify(success=False, error="No source files found to derive mask names"), 400
-
-            # Determine destination mask folder next to the uploaded folder
-            if src_is_list:
-                first_dir = os.path.dirname(src_files[0]) if src_files else os.path.abspath(".")
-                parent = os.path.dirname(first_dir)
-                dir_name = os.path.basename(first_dir)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
-            elif src_is_dir:
+        def _mask_dir_anchor():
+            if src_is_dir and isinstance(img_path, str):
+                return img_path
+            if cached_image_files:
+                first = cached_image_files[0]
+                parent = os.path.dirname(first)
+                return parent if parent else first
+            if src_is_list and isinstance(img_path, list) and img_path:
+                first = img_path[0]
+                parent = os.path.dirname(first)
+                return parent if parent else first
+            if isinstance(img_path, str) and os.path.isfile(img_path):
                 parent = os.path.dirname(img_path)
-                dir_name = os.path.basename(img_path)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
-            else:
-                # glob: use base directory of the glob and folder name
-                base_dir = os.path.dirname(img_path)
-                dir_name = os.path.basename(base_dir)
-                parent = os.path.dirname(base_dir)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
+                return parent if parent else img_path
+            return img_path
 
-            os.makedirs(mask_dir, exist_ok=True)
+        source_files_for_naming = _resolve_source_files()
+        mask_files_cache = current_app.config.get("PROOFREADING_MASK_FILES", [])
 
-            # Only save edited slice(s)
+        # Folder/glob/list datasets: always save per-slice files, only for edited slices
+        if dataset_has_multiple_sources:
             edited = current_app.config.get("PROOFREADING_EDITED_SLICES", set())
-            edited_list = sorted(list(edited))
+            edited_list = sorted(edited)
             if not edited_list:
                 return jsonify(success=True, message="No edited slices to save"), 200
-            # Get original mask file paths if available
-            mask_files = current_app.config.get("PROOFREADING_MASK_FILES", [])
-            
+
+            if mask_path and os.path.isdir(mask_path):
+                mask_dir = mask_path
+            else:
+                mask_dir = _saved_masks_dir_for(_mask_dir_anchor())
+                session_manager.update(mask_path=mask_dir)
+                current_app.config["PROOFREADING_MASK_PATH"] = mask_dir
+            os.makedirs(mask_dir, exist_ok=True)
+
+            def _slice_output_path(z_idx, base_name, ext_hint):
+                allowed_exts = [".tif", ".tiff", ".png", ".jpg", ".jpeg"]
+                ext_use = ext_hint if ext_hint in allowed_exts else ".tif"
+                out_fp = None
+                if mask_files_cache and z_idx < len(mask_files_cache) and mask_files_cache[z_idx]:
+                    out_fp = mask_files_cache[z_idx]
+                else:
+                    out_fp = os.path.join(mask_dir, f"{base_name}_mask{ext_use}")
+                return out_fp
+
+            saved_paths = []
             for z in edited_list:
                 if z < 0:
                     continue
-                src_fp = src_files[z if z < len(src_files) else -1]
-                base = os.path.splitext(os.path.basename(src_fp))[0]
-                ext_out = os.path.splitext(src_fp)[-1].lower()
-                
-                # Try to use original mask file path if it exists
-                out_fp = None
-                if mask_files and z < len(mask_files) and mask_files[z]:
-                    # Use the original mask file path
-                    out_fp = mask_files[z]
-                    print(f"DEBUG: Saving to original mask file: {out_fp}")
+                if source_files_for_naming:
+                    src_idx = min(max(z, 0), len(source_files_for_naming) - 1)
+                    src_fp = source_files_for_naming[src_idx]
+                    base = os.path.splitext(os.path.basename(src_fp))[0]
+                    ext_out = os.path.splitext(src_fp)[-1].lower()
                 else:
-                    # Fallback: try to find the original mask file by matching naming patterns
-                    for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
-                        candidate = os.path.join(mask_dir, f"{base}{suffix}{ext_out}")
-                        if os.path.exists(candidate):
-                            out_fp = candidate
-                            print(f"DEBUG: Found original mask file: {out_fp}")
-                            break
-                    
-                    # If still not found, use _mask suffix as fallback
-                    if out_fp is None:
-                        out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
-                        print(f"DEBUG: Using new mask file (original not found): {out_fp}")
-                sl = mask_edits.get(z)
+                    base = f"slice_{z:04d}"
+                    ext_out = ".tif"
+
+                out_fp = _slice_output_path(z, base, ext_out)
+                os.makedirs(os.path.dirname(out_fp), exist_ok=True)
+
+                sl = mask_edits.pop(z, None)
                 if sl is None:
-                    # No edits for this slice - if saving to original file, preserve it by not saving
-                    if os.path.exists(out_fp):
-                        # File already exists and hasn't been edited - skip save to preserve original format
-                        print(f"DEBUG: Slice {z} not edited, skipping save to preserve original file: {out_fp}")
-                        continue
-                    else:
-                        # New file - load from mask
-                        if mask_is_lazy:
+                    if mask_is_lazy:
+                        try:
                             sl = mask.get_slice(z)
-                        elif mask.ndim == 3 and z < mask.shape[0]:
+                        except Exception:
+                            sl = None
+                    elif isinstance(mask, np.ndarray):
+                        if mask.ndim == 3 and z < mask.shape[0]:
                             sl = mask[z]
                         elif mask.ndim == 2:
-                            sl = mask
+                            sl = mask.copy()
                 if sl is None:
                     continue
-                # Save preserving original format if saving to original file
+
                 try:
                     save_mask(sl, out_fp, preserve_format_from=out_fp if os.path.exists(out_fp) else None)
+                    saved_paths.append(out_fp)
                 except Exception as slice_save_err:
                     print(f"ERROR saving slice {z} to {out_fp}: {slice_save_err}")
                     import traceback
                     traceback.print_exc()
-                    # Re-raise to be caught by outer handler
                     raise
 
-            # Update session to reference the mask directory
-            session_manager.update(mask_path=mask_dir)
-            current_app.config["PROOFREADING_MASK_PATH"] = mask_dir
-            for z in edited_list:
-                mask_edits.pop(z, None)
             current_app.config["PROOFREADING_MASK_EDITS"] = mask_edits
-            # Clear edited set after successful save
             current_app.config["PROOFREADING_EDITED_SLICES"] = set()
-            return jsonify(success=True, message=f"Mask slices saved to {mask_dir}")
+            if saved_paths:
+                return jsonify(success=True, message=f"Mask slice(s) saved to {os.path.dirname(saved_paths[0])}")
+            return jsonify(success=True, message="No slices were saved (no data available)"), 200
 
         # Default behavior: single file path (TIFF stack or 2D image)
+        # If no edits were recorded, skip saving to avoid overwriting the original mask
+        edited_global = current_app.config.get("PROOFREADING_EDITED_SLICES", set())
+        if not edited_global and not mask_edits:
+            return jsonify(success=True, message="No edited slices to save"), 200
+
         # Determine save directory and filename
         # Only create _uploads folder for actual uploads, not when reading from file paths
         if load_mode == "upload":
-            base_dir = os.path.abspath("./_uploads")
-            os.makedirs(base_dir, exist_ok=True)
             image_name = session_state.get("image_name", "image")
             if not image_name or image_name == "image":
                 image_name = "image"
+            base_dir = _saved_masks_dir_for(image_name)
             base_name = os.path.splitext(os.path.basename(image_name))[0]
         elif img_path and os.path.exists(img_path):
-            # Use existing file path - don't create _uploads
-            base_dir = os.path.dirname(img_path)
+            base_dir = _saved_masks_dir_for(img_path)
             base_name = os.path.splitext(os.path.basename(img_path))[0]
         else:
-            # Fallback: if path doesn't exist and not upload, use current directory
-            base_dir = os.path.abspath(".")
+            base_dir = _saved_masks_root()
             base_name = "image"
 
         ext = ".tif"
@@ -990,8 +993,9 @@ def api_save():
                 
                 # Only create new file if no original found
                 if not found_original:
-                    mask_path = os.path.join(base_dir, f"{base_name}_mask{ext}")
-                    print(f"DEBUG: No original mask found, will create new file: {mask_path}")
+                    mask_dir = _saved_masks_dir_for(img_path)
+                    mask_path = os.path.join(mask_dir, f"{base_name}_mask{ext}")
+                    print(f"DEBUG: No original mask found, will create new file in repo folder: {mask_path}")
         elif not mask_path:
             # For uploads or fallback cases, create new mask file
             mask_path = os.path.join(base_dir, f"{base_name}_mask{ext}")
@@ -1022,6 +1026,11 @@ def api_save():
             # Ensure mask is a numpy array before saving
             if not isinstance(mask, np.ndarray):
                 return jsonify(success=False, error=f"Mask must be a numpy array, got {type(mask)}"), 400
+
+            mask, edits_applied = _apply_pending_mask_edits(mask, mask_edits)
+            mask = _ensure_mask_matches_volume(mask, volume)
+            if edits_applied:
+                current_app.config["PROOFREADING_MASK"] = mask
             
             print(f"DEBUG: Saving mask with shape {mask.shape if mask is not None else 'None'}")
             print(f"DEBUG: Saving to path: {mask_path}")
@@ -1038,6 +1047,8 @@ def api_save():
                 return jsonify(success=False, error=f"Failed to save mask: {str(save_err)}"), 500
             
             current_app.config["PROOFREADING_MASK_EDITS"] = {}
+            current_app.config["PROOFREADING_EDITED_SLICES"] = set()
+            current_app.config["PROOFREADING_MASK"] = mask
             return jsonify(success=True, message=f"Mask saved to {mask_path}")
         except Exception as e:
             print(f"Save error: {e}")

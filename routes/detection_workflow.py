@@ -14,6 +14,17 @@ from backend.utils import jsonify_dimensions
 
 bp = Blueprint("detection_workflow", __name__, url_prefix="")
 
+
+def _uploads_root() -> str:
+    env_dir = os.environ.get("PROOFREADING_UPLOAD_DIR")
+    if env_dir:
+        base_dir = os.path.abspath(env_dir)
+    else:
+        base_dir = os.path.join(os.path.expanduser("~"), "proofreading_uploads")
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
 def register_detection_workflow_routes(app):
     app.register_blueprint(bp)
 
@@ -112,8 +123,7 @@ def detection_load_post():
                                     error="At least one image file is required")
 
             # Save uploaded files temporarily
-            upload_dir = "_uploads"
-            os.makedirs(upload_dir, exist_ok=True)
+            upload_dir = _uploads_root()
 
             saved_image_paths = []
             for f in image_files:

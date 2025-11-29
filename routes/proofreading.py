@@ -7,11 +7,82 @@ Handles the integrated proofreading interface for correcting incorrect layers.
 import os
 import io
 import base64
+from typing import Optional, Tuple
+
 import numpy as np
 from flask import Blueprint, render_template, request, current_app, jsonify, send_file, redirect, url_for
 from PIL import Image
 from backend.volume_manager import list_images_for_path, load_image_or_stack, load_mask_like, save_mask, stack_2d_images
 from backend.data_manager import _normalize_image_slice_to_rgb, _mask_slice_to_rgba
+
+try:
+    from backend.ai.sam_utils import apply_sam_segmentation
+except ImportError:  # pragma: no cover
+    apply_sam_segmentation = None
+
+
+def _uploads_root() -> str:
+    env_dir = os.environ.get("PROOFREADING_UPLOAD_DIR")
+    if env_dir:
+        base_dir = os.path.abspath(env_dir)
+    else:
+        base_dir = os.path.join(os.path.expanduser("~"), "proofreading_uploads")
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _saved_masks_root() -> str:
+    path = os.path.join(PROJECT_ROOT, "_saved_masks")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _saved_masks_dir_for(image_path) -> str:
+    candidate = None
+    if isinstance(image_path, list) and image_path:
+        candidate = image_path[0]
+    elif isinstance(image_path, str):
+        candidate = image_path
+
+    base_name = "dataset"
+    if isinstance(candidate, str) and candidate:
+        norm = os.path.abspath(candidate)
+        if os.path.isdir(norm):
+            base_name = os.path.basename(norm)
+        else:
+            base_name = os.path.splitext(os.path.basename(norm))[0]
+
+    target = os.path.join(_saved_masks_root(), base_name)
+    os.makedirs(target, exist_ok=True)
+    return target
+
+
+def _extract_mask_slice(mask: np.ndarray, slice_idx: int) -> np.ndarray:
+    if mask is None:
+        return None
+    if isinstance(mask, np.ndarray) and mask.ndim == 3:
+        idx = max(0, min(slice_idx, mask.shape[0] - 1))
+        return mask[idx]
+    return mask
+
+
+def _ensure_mask_matches_volume(mask_array: Optional[np.ndarray], volume) -> Optional[np.ndarray]:
+    if isinstance(mask_array, np.ndarray):
+        vol_ndim = getattr(volume, "ndim", None)
+        if mask_array.ndim == 3 and mask_array.shape[0] == 1 and vol_ndim == 2:
+            return np.squeeze(mask_array, axis=0)
+    return mask_array
+
+
+def _ensure_mask_matches_volume(mask_array: Optional[np.ndarray], volume) -> Optional[np.ndarray]:
+    if isinstance(mask_array, np.ndarray):
+        vol_ndim = getattr(volume, "ndim", None)
+        if mask_array.ndim == 3 and mask_array.shape[0] == 1 and vol_ndim == 2:
+            return np.squeeze(mask_array, axis=0)
+    return mask_array
 def _cached_detection_image_files():
     files = current_app.config.get("DETECTION_IMAGE_FILES")
     if files:
@@ -533,6 +604,10 @@ def api_save():
             current_app.config["INTEGRATED_MASK"] = mask
         elif mask is None:
             return jsonify({"success": False, "error": "No mask or image loaded"}), 400
+
+        if isinstance(mask, np.ndarray):
+            mask = _ensure_mask_matches_volume(mask, volume)
+            current_app.config["INTEGRATED_MASK"] = mask
         
         # Get session data
         session_manager = current_app.session_manager
@@ -545,208 +620,239 @@ def api_save():
         src_is_dir = bool(image_path and isinstance(image_path, str) and os.path.isdir(image_path))
         src_is_glob = bool(image_path and isinstance(image_path, str) and any(ch in image_path for ch in ['*','?','[']) and not os.path.exists(image_path))
         src_is_list = isinstance(image_path, list)
-        # Case A: user provided a mask folder → save current slice into that folder
-        if (src_is_dir or src_is_glob or src_is_list) and mask_path and os.path.isdir(mask_path):
-            mask_dir = mask_path
-            os.makedirs(mask_dir, exist_ok=True)
+        cached_image_files = current_app.config.get("DETECTION_IMAGE_FILES") or []
+        cached_has_multiple = len(cached_image_files) > 1
+        dataset_has_multiple_sources = src_is_dir or src_is_glob or src_is_list or cached_has_multiple
 
-            # Determine source filename for current slice
-            src_fp = None
-            try:
-                if src_is_list:
-                    src_fp = image_path[slice_idx] if slice_idx < len(image_path) else image_path[-1]
-                elif src_is_dir:
-                    candidates = []
-                    for ext in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                        candidates = sorted([
-                            os.path.join(image_path, f)
-                            for f in os.listdir(image_path)
-                            if f.lower().endswith(ext)
-                        ])
-                        if candidates:
-                            break
-                    if candidates:
-                        src_fp = candidates[slice_idx] if slice_idx < len(candidates) else candidates[-1]
-                else:
-                    import glob as _glob
-                    files = sorted(_glob.glob(image_path))
-                    if files:
-                        src_fp = files[slice_idx] if slice_idx < len(files) else files[-1]
-            except Exception:
-                src_fp = None
+        def _resolve_source_files():
+            if cached_image_files:
+                return cached_image_files
+            if src_is_list and isinstance(image_path, list):
+                return list(image_path)
+            if src_is_dir and isinstance(image_path, str):
+                selected = []
+                for ext in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+                    selected = sorted([
+                        os.path.join(image_path, f)
+                        for f in os.listdir(image_path)
+                        if f.lower().endswith(ext)
+                    ])
+                    if selected:
+                        break
+                return selected
+            if src_is_glob and isinstance(image_path, str):
+                import glob as _glob
+                return sorted(_glob.glob(image_path))
+            if isinstance(image_path, str) and image_path:
+                return [image_path]
+            return []
 
-            if src_fp is None:
-                out_fp = os.path.join(mask_dir, f"slice_{slice_idx:04d}_mask.tif")
-            else:
-                base = os.path.splitext(os.path.basename(src_fp))[0]
-                ext_out = os.path.splitext(src_fp)[-1].lower()
-                out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
-
-            # Use format preservation if saving to original file
-            save_mask(mask, out_fp, preserve_format_from=out_fp if os.path.exists(out_fp) else None)
-            return jsonify({"success": True, "message": f"Mask slice saved to {out_fp}"})
-
-        # Case B: no mask folder → create sibling folder and save current slice
-        if not mask_path and (src_is_dir or src_is_glob or src_is_list):
-            # Determine mask directory next to uploaded folder
-            if src_is_list:
-                first_dir = os.path.dirname(image_path[0]) if image_path else os.path.abspath(".")
-                parent = os.path.dirname(first_dir)
-                dir_name = os.path.basename(first_dir)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
-            elif src_is_dir:
+        def _mask_dir_anchor():
+            if src_is_dir and isinstance(image_path, str):
+                return image_path
+            if cached_image_files:
+                first = cached_image_files[0]
+                parent = os.path.dirname(first)
+                return parent if parent else first
+            if src_is_list and isinstance(image_path, list) and image_path:
+                first = image_path[0]
+                parent = os.path.dirname(first)
+                return parent if parent else first
+            if isinstance(image_path, str) and os.path.isfile(image_path):
                 parent = os.path.dirname(image_path)
-                dir_name = os.path.basename(image_path)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
-            else:
-                base_dir = os.path.dirname(image_path)
-                dir_name = os.path.basename(base_dir)
-                parent = os.path.dirname(base_dir)
-                mask_dir = os.path.join(parent, f"{dir_name}_mask")
-            os.makedirs(mask_dir, exist_ok=True)
+                return parent if parent else image_path
+            return image_path
 
-            # Determine source filename for current slice if possible
+        source_files_for_naming = _resolve_source_files()
+        mask_files = current_app.config.get("PROOFREADING_MASK_FILES") or []
+
+        if dataset_has_multiple_sources:
             src_fp = None
             try:
-                if src_is_list:
-                    src_fp = image_path[slice_idx] if slice_idx < len(image_path) else image_path[-1]
-                elif src_is_dir:
-                    candidates = []
-                    for ext in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
-                        candidates = sorted([
-                            os.path.join(image_path, f)
-                            for f in os.listdir(image_path)
-                            if f.lower().endswith(ext)
-                        ])
-                        if candidates:
-                            break
-                    if candidates:
-                        src_fp = candidates[slice_idx] if slice_idx < len(candidates) else candidates[-1]
-                else:
-                    import glob as _glob
-                    files = sorted(_glob.glob(image_path))
-                    if files:
-                        src_fp = files[slice_idx] if slice_idx < len(files) else files[-1]
+                if source_files_for_naming:
+                    src_fp = source_files_for_naming[slice_idx] if slice_idx < len(source_files_for_naming) else source_files_for_naming[-1]
             except Exception:
                 src_fp = None
 
+            if src_fp is None and source_files_for_naming:
+                src_fp = source_files_for_naming[-1]
+
             if src_fp is None:
-                # Fallback generic name
-                out_fp = os.path.join(mask_dir, f"slice_{slice_idx:04d}_mask.tif")
+                base = f"slice_{slice_idx:04d}"
+                ext_out = ".tif"
             else:
                 base = os.path.splitext(os.path.basename(src_fp))[0]
                 ext_out = os.path.splitext(src_fp)[-1].lower()
-                out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
+                if ext_out not in [".tif", ".tiff", ".png", ".jpg", ".jpeg"]:
+                    ext_out = ".tif"
 
-            save_mask(mask, out_fp)
-            session_manager.update(mask_path=mask_dir)
+            out_fp = None
+            if mask_files and slice_idx < len(mask_files) and mask_files[slice_idx]:
+                out_fp = mask_files[slice_idx]
+            elif mask_path and os.path.isdir(mask_path):
+                out_fp = os.path.join(mask_path, f"{base}_mask{ext_out}")
+            else:
+                mask_dir_source = _mask_dir_anchor()
+                mask_dir = _saved_masks_dir_for(mask_dir_source)
+                out_fp = os.path.join(mask_dir, f"{base}_mask{ext_out}")
+                session_manager.update(mask_path=mask_dir)
+
+            os.makedirs(os.path.dirname(out_fp), exist_ok=True)
+
+            mask_slice = _extract_mask_slice(mask, slice_idx)
+            save_mask(mask_slice, out_fp, preserve_format_from=out_fp if os.path.exists(out_fp) else None)
             return jsonify({"success": True, "message": f"Mask slice saved to {out_fp}"})
 
         # Generate mask path if not provided (file-based)
-        # Only create _uploads folder for actual uploads, not when reading from file paths
+        # Only create shared uploads folder for actual uploads, not when reading from file paths
         if not mask_path:
-            if load_mode == "upload":
-                base_dir = os.path.abspath("./_uploads")
-                os.makedirs(base_dir, exist_ok=True)
-                image_name = session_state.get("image_name", "image")
-                if not image_name or image_name == "image":
-                    image_name = "image"
-                original_base = os.path.splitext(os.path.basename(image_name))[0]
-            elif image_path and os.path.exists(image_path):
-                # Use existing file path - don't create _uploads
-                base_dir = os.path.dirname(image_path)
-                original_base = os.path.splitext(os.path.basename(image_path))[0]
+            if dataset_has_multiple_sources:
+                mask_path = _saved_masks_dir_for(_mask_dir_anchor())
             else:
-                # Fallback: if path doesn't exist and not upload, use current directory
-                base_dir = os.path.abspath(".")
-                original_base = "image"
-
-            # Detect extension
-            ext = ".tif"
-            if isinstance(image_path, str) and image_path:
-                _, src_ext = os.path.splitext(image_path.lower())
-                if src_ext in [".png", ".jpg", ".jpeg"]:
-                    ext = src_ext
-
-            # For file paths (not uploads), try to find original mask file first
-            # Only create new mask file if no original exists
-            if load_mode == "path" and image_path and os.path.exists(image_path):
-                # If mask_path is already a file, use it
-                if mask_path and os.path.isfile(mask_path):
-                    print(f"DEBUG: Using existing mask file from session: {mask_path}")
+                if load_mode == "upload":
+                    image_name = session_state.get("image_name", "image")
+                    if not image_name or image_name == "image":
+                        image_name = "image"
+                    base_dir = _saved_masks_dir_for(image_name)
+                    original_base = os.path.splitext(os.path.basename(image_name))[0]
+                elif image_path and os.path.exists(image_path):
+                    base_dir = _saved_masks_dir_for(image_path)
+                    original_base = os.path.splitext(os.path.basename(image_path))[0]
                 else:
-                    # Try to find original mask file using naming patterns
-                    base, _ = os.path.splitext(os.path.basename(image_path))
-                    img_dir = os.path.dirname(image_path)
-                    found_original = False
-                    
-                    # Try common mask naming patterns in order of preference
-                    for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
-                        candidate = os.path.join(img_dir, f"{base}{suffix}{ext}")
-                        if os.path.exists(candidate):
-                            mask_path = candidate
-                            found_original = True
-                            print(f"DEBUG: Found original mask file: {mask_path}")
-                            break
-                    
-                    # If not found, also check parent directory for prediction folders
-                    if not found_original and img_dir:
-                        parent_dir = os.path.dirname(img_dir)
-                        dir_name = os.path.basename(img_dir)
-                        for pred_dir_name in [f"{dir_name}_predictions", f"{dir_name}_pred"]:
-                            pred_dir = os.path.join(parent_dir, pred_dir_name)
-                            if os.path.isdir(pred_dir):
-                                for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
-                                    candidate = os.path.join(pred_dir, f"{base}{suffix}{ext}")
-                                    if os.path.exists(candidate):
-                                        mask_path = candidate
-                                        found_original = True
-                                        print(f"DEBUG: Found original mask file in prediction folder: {mask_path}")
+                    base_dir = _saved_masks_root()
+                    original_base = "image"
+
+                # Detect extension
+                ext = ".tif"
+                if isinstance(image_path, str) and image_path:
+                    _, src_ext = os.path.splitext(image_path.lower())
+                    if src_ext in [".png", ".jpg", ".jpeg"]:
+                        ext = src_ext
+
+                # For file paths (not uploads), try to find original mask file first
+                # Only create new mask file if no original exists
+                if load_mode == "path" and image_path and os.path.exists(image_path):
+                    # If mask_path is already a file, use it
+                    if mask_path and os.path.isfile(mask_path):
+                        print(f"DEBUG: Using existing mask file from session: {mask_path}")
+                    else:
+                        # Try to find original mask file using naming patterns
+                        base, _ = os.path.splitext(os.path.basename(image_path))
+                        img_dir = os.path.dirname(image_path)
+                        found_original = False
+                        
+                        # Try common mask naming patterns in order of preference
+                        for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
+                            candidate = os.path.join(img_dir, f"{base}{suffix}{ext}")
+                            if os.path.exists(candidate):
+                                mask_path = candidate
+                                found_original = True
+                                print(f"DEBUG: Found original mask file: {mask_path}")
+                                break
+                        
+                        # If not found, also check parent directory for prediction folders
+                        if not found_original and img_dir:
+                            parent_dir = os.path.dirname(img_dir)
+                            dir_name = os.path.basename(img_dir)
+                            for pred_dir_name in [f"{dir_name}_predictions", f"{dir_name}_pred"]:
+                                pred_dir = os.path.join(parent_dir, pred_dir_name)
+                                if os.path.isdir(pred_dir):
+                                    for suffix in ["_pred_skeleton", "_pred", "_prediction", "_mask"]:
+                                        candidate = os.path.join(pred_dir, f"{base}{suffix}{ext}")
+                                        if os.path.exists(candidate):
+                                            mask_path = candidate
+                                            found_original = True
+                                            print(f"DEBUG: Found original mask file in prediction folder: {mask_path}")
+                                            break
+                                    if found_original:
                                         break
-                                if found_original:
-                                    break
-                    
-                    # Only create new file if no original found
-                    if not found_original:
-                        mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
-                        print(f"DEBUG: No original mask found, will create new file: {mask_path}")
-            elif not mask_path:
-                # For uploads or fallback cases, create new mask file
-                mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
+                        
+                        # Only create new file if no original found
+                        if not found_original:
+                            mask_dir = _saved_masks_dir_for(image_path)
+                            mask_path = os.path.join(mask_dir, f"{original_base}_mask{ext}")
+                            print(f"DEBUG: No original mask found, will create new file in repo folder: {mask_path}")
+                elif not mask_path:
+                    # For uploads or fallback cases, create new mask file
+                    mask_path = os.path.join(base_dir, f"{original_base}_mask{ext}")
             
             session_manager.update(mask_path=mask_path)
         
         try:
-            # Load the full volume and mask to update the specific slice
-            full_volume = load_image_or_stack(image_path)
-            full_mask = load_mask_like(mask_path, full_volume)
-            
+            full_volume = None
+            full_mask = None
+            if mask_path and os.path.isfile(mask_path):
+                full_volume = load_image_or_stack(image_path)
+                full_mask = load_mask_like(mask_path, full_volume)
+                full_mask = _ensure_mask_matches_volume(full_mask, full_volume)
+
+            dataset_base = "image"
+            if source_files_for_naming:
+                src_for_base = source_files_for_naming[slice_idx] if slice_idx < len(source_files_for_naming) else source_files_for_naming[-1]
+                dataset_base = os.path.splitext(os.path.basename(src_for_base))[0]
+            elif isinstance(image_path, list) and image_path:
+                idx = min(slice_idx, len(image_path) - 1)
+                dataset_base = os.path.splitext(os.path.basename(image_path[idx]))[0]
+            elif isinstance(image_path, str) and image_path:
+                dataset_base = os.path.splitext(os.path.basename(image_path))[0]
+
             if full_mask is not None:
-                # Update the specific slice in the full mask
                 if full_mask.ndim == 3 and slice_idx < full_mask.shape[0]:
                     full_mask[slice_idx] = mask
                 elif full_mask.ndim == 2:
                     full_mask[:] = mask
-                
-                # Save the updated full mask with format preservation (matching standalone)
-                save_mask(full_mask, mask_path, preserve_format_from=mask_path if os.path.exists(mask_path) else None)
-                
-                # Also update the detection workflow's mask if it exists
-                detection_mask = current_app.config.get("DETECTION_MASK")
-                if detection_mask is not None:
-                    if detection_mask.ndim == 3 and slice_idx < detection_mask.shape[0]:
-                        detection_mask[slice_idx] = mask
-                    elif detection_mask.ndim == 2:
-                        detection_mask[:] = mask
-                    current_app.config["DETECTION_MASK"] = detection_mask
-                
-                return jsonify({"success": True, "message": f"Mask slice {slice_idx} saved to {mask_path}"})
+
+                is_stack = full_mask.ndim >= 3 and getattr(full_volume, "ndim", 2) >= 3
+                if is_stack:
+                    slice_mask = _extract_mask_slice(full_mask, slice_idx)
+                    dir_source = _mask_dir_anchor()
+                    target_dir = _saved_masks_dir_for(dir_source)
+                    out_name = f"{dataset_base}_z{slice_idx:04d}.tif"
+                    out_path = os.path.join(target_dir, out_name)
+                    save_mask(
+                        slice_mask,
+                        out_path,
+                        preserve_format_from=out_path if os.path.exists(out_path) else None,
+                    )
+                    session_manager.update(mask_path=target_dir)
+                    current_app.config["PROOFREADING_MASK"] = full_mask
+                    current_app.config["PROOFREADING_MASK_EDITS"] = {}
+                    current_app.config["PROOFREADING_EDITED_SLICES"] = set()
+
+                    detection_mask = current_app.config.get("DETECTION_MASK")
+                    if detection_mask is not None:
+                        if detection_mask.ndim == 3 and slice_idx < detection_mask.shape[0]:
+                            detection_mask[slice_idx] = slice_mask
+                        elif detection_mask.ndim == 2:
+                            detection_mask[:] = slice_mask
+                        current_app.config["DETECTION_MASK"] = detection_mask
+
+                    return jsonify({"success": True, "message": f"Mask slice {slice_idx} saved to {out_path}"})
+                else:
+                    save_mask(full_mask, mask_path, preserve_format_from=mask_path if mask_path and os.path.exists(mask_path) else None)
+                    detection_mask = current_app.config.get("DETECTION_MASK")
+                    if detection_mask is not None:
+                        replacement = _extract_mask_slice(full_mask, slice_idx) if full_mask.ndim >= 3 else full_mask
+                        if detection_mask.ndim == 3 and slice_idx < detection_mask.shape[0]:
+                            detection_mask[slice_idx] = replacement
+                        elif detection_mask.ndim == 2:
+                            detection_mask[:] = replacement
+                        current_app.config["DETECTION_MASK"] = detection_mask
+
+                    current_app.config["PROOFREADING_MASK"] = full_mask
+                    current_app.config["PROOFREADING_MASK_EDITS"] = {}
+                    current_app.config["PROOFREADING_EDITED_SLICES"] = set()
+                    return jsonify({"success": True, "message": f"Mask slice {slice_idx} saved to {mask_path}"})
             else:
-                # If no existing mask, create one with the edited slice
-                # Use format preservation if saving to an existing file
-                save_mask(mask, mask_path, preserve_format_from=mask_path if os.path.exists(mask_path) else None)
-                return jsonify({"success": True, "message": f"New mask saved to {mask_path}"})
-                
+                dir_source = _mask_dir_anchor()
+                target_dir = _saved_masks_dir_for(dir_source)
+                slice_mask = _extract_mask_slice(mask, slice_idx) if isinstance(mask, np.ndarray) and mask.ndim >= 3 else mask
+                out_name = f"{dataset_base}_z{slice_idx:04d}.tif"
+                out_path = os.path.join(target_dir, out_name)
+                save_mask(slice_mask, out_path, preserve_format_from=out_path if os.path.exists(out_path) else None)
+                session_manager.update(mask_path=target_dir)
+                return jsonify({"success": True, "message": f"New mask saved to {out_path}"})
+
         except Exception as e:
             print(f"Save error: {e}")
             import traceback
@@ -758,6 +864,62 @@ def api_save():
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         return jsonify({"success": False, "error": f"Failed to save mask: {str(e)}"}), 500
+
+@bp.route("/api/sam/segment_current", methods=["POST"])
+def sam_segment_current():
+    """SAM segmentation endpoint for integrated proofreading."""
+    try:
+        if apply_sam_segmentation is None:
+            return jsonify({"error": "SAM integration not available in this build"}), 501
+
+        data = request.get_json()
+        points = data.get("points", [])
+        point_labels = data.get("point_labels", [])
+
+        if not points or not point_labels:
+            return jsonify({"error": "Points and point_labels are required"}), 400
+
+        volume = current_app.config.get("INTEGRATED_VOLUME")
+        if volume is None:
+            return jsonify({"error": "No volume loaded"}), 400
+
+        image_slice = volume if volume.ndim == 2 else volume[0]
+
+        try:
+            from backend.ai.sam_init import initialize_sam_model
+            model = initialize_sam_model()
+        except ImportError as e:
+            return jsonify({"error": f"SAM not available: {str(e)}"}), 500
+
+        mask = current_app.config.get("INTEGRATED_MASK")
+        current_mask_slice = None
+        if mask is not None:
+            current_mask_slice = mask if mask.ndim == 2 else mask[0]
+
+        result_mask, mask_b64 = apply_sam_segmentation(
+            model,
+            image_slice,
+            current_mask_slice,
+            points,
+            point_labels,
+            slice_index=0,
+        )
+
+        if mask is None:
+            mask = result_mask.copy()
+        else:
+            if mask.ndim == 2:
+                mask = result_mask.copy()
+            else:
+                mask[0] = result_mask
+        current_app.config["INTEGRATED_MASK"] = mask
+
+        return jsonify({"success": True, "mask": mask_b64})
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @bp.route("/api/dims", methods=["POST"])
 def api_dims():

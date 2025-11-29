@@ -16,6 +16,17 @@ import uuid
 
 bp = Blueprint("landing", __name__, url_prefix="")
 
+
+def _uploads_root() -> str:
+    env_dir = os.environ.get("PROOFREADING_UPLOAD_DIR")
+    if env_dir:
+        base_dir = os.path.abspath(env_dir)
+    else:
+        base_dir = os.path.join(os.path.expanduser("~"), "proofreading_uploads")
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
 def register_landing_routes(app):
     app.register_blueprint(bp)
 
@@ -55,9 +66,7 @@ def handle_upload():
         flash("Please select an image file", "error")
         return redirect(url_for("landing.landing"))
     
-    # Create uploads directory
-    upload_dir = os.path.abspath("./_uploads")
-    os.makedirs(upload_dir, exist_ok=True)
+    upload_dir = _uploads_root()
     
     # Save uploaded files
     image_path = os.path.join(upload_dir, image_file.filename)
