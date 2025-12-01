@@ -1047,8 +1047,8 @@ function paint(e){
     mctx.fillStyle = 'rgba(255, 255, 255, 0.7)'; // White with opacity
     mctx.globalCompositeOperation = 'source-over';
   } else {
-    // Erase mode - clear the overlay
-    mctx.fillStyle = 'rgba(0, 0, 0, 0)';
+    // Erase mode - draw fully opaque strokes so destination-out actually removes pixels
+    mctx.fillStyle = 'rgba(0, 0, 0, 1)';
     mctx.globalCompositeOperation = 'destination-out';
   }
   

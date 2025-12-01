@@ -936,13 +936,71 @@ async function loadSlice(){
   }
   
   bctx.drawImage(imgBitmap, 0, 0);
+
+  maskVisible = true;
+  mask.style.visibility = 'visible';
+  toggleBtn.textContent = 'Hide Mask';
+
   mctx.clearRect(0,0,mask.width,mask.height);
-  mctx.drawImage(maskBitmap, 0, 0);
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = maskBitmap.width;
+  tempCanvas.height = maskBitmap.height;
+  const tempCtx = tempCanvas.getContext('2d');
+  tempCtx.drawImage(maskBitmap, 0, 0);
+
+  const rgbaData = tempCtx.getImageData(0, 0, maskBitmap.width, maskBitmap.height);
+  const overlayRGBA = mctx.createImageData(mask.width, mask.height);
+  const rgbaPixels = rgbaData.data;
+  const overlayPixels = overlayRGBA.data;
+
+  for (let i = 0; i < rgbaPixels.length; i += 4) {
+    const r = rgbaPixels[i];
+    const g = rgbaPixels[i + 1];
+    const b = rgbaPixels[i + 2];
+    const a = rgbaPixels[i + 3];
+    const isMaskPixel = (a > 50 && (r > 200 || g > 200 || b > 200));
+    if (isMaskPixel) {
+      overlayPixels[i] = 255;
+      overlayPixels[i + 1] = 255;
+      overlayPixels[i + 2] = 255;
+      overlayPixels[i + 3] = 180;
+    } else {
+      overlayPixels[i + 3] = 0;
+    }
+  }
+
+  mctx.putImageData(overlayRGBA, 0, 0);
 
   if (editedSlices[z]) {
     const img = new Image();
     img.src = "data:image/png;base64," + editedSlices[z];
-    await new Promise(res => { img.onload = () => res(mctx.drawImage(img, 0, 0)); });
+    await new Promise(res => { 
+      img.onload = () => {
+        const tempCanvasEdit = document.createElement('canvas');
+        tempCanvasEdit.width = mask.width;
+        tempCanvasEdit.height = mask.height;
+        const tempEditCtx = tempCanvasEdit.getContext('2d');
+        tempEditCtx.drawImage(img, 0, 0);
+        const grayData = tempEditCtx.getImageData(0, 0, mask.width, mask.height);
+        const overlayData = mctx.createImageData(mask.width, mask.height);
+        const grayPixels = grayData.data;
+        const overlayPixelsEdit = overlayData.data;
+        for (let i = 0; i < grayPixels.length; i += 4) {
+          const gray = grayPixels[i];
+          if (gray > 0) {
+            overlayPixelsEdit[i] = 255;
+            overlayPixelsEdit[i + 1] = 255;
+            overlayPixelsEdit[i + 2] = 255;
+            overlayPixelsEdit[i + 3] = 180;
+          } else {
+            overlayPixelsEdit[i + 3] = 0;
+          }
+        }
+        mctx.putImageData(overlayData, 0, 0);
+        res();
+      };
+    });
   }
   undoStacks[z] = undoStacks[z] || [];
   redoStacks[z] = redoStacks[z] || [];
@@ -1038,7 +1096,13 @@ function paint(e){
   const clampedX = Math.max(0, Math.min(base.width - 1, x));
   const clampedY = Math.max(0, Math.min(base.height - 1, y));
   
-  mctx.fillStyle = mode === 'add' ? 'white' : 'black';
+  if (mode === 'add') {
+    mctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    mctx.globalCompositeOperation = 'source-over';
+  } else {
+    mctx.fillStyle = 'rgba(0, 0, 0, 1)';
+    mctx.globalCompositeOperation = 'destination-out';
+  }
   
   // Draw smooth brush strokes by connecting points with filled circles
   if (lastBrushX !== null && lastBrushY !== null) {
@@ -1066,10 +1130,14 @@ function paint(e){
   mctx.beginPath();
   mctx.arc(clampedX, clampedY, brush, 0, 2*Math.PI);
   mctx.fill();
+
+  // Reset composite so future operations default to normal drawing
+  mctx.globalCompositeOperation = 'source-over';
   
   // Update last position for smooth drawing
   lastBrushX = clampedX;
   lastBrushY = clampedY;
+  dirty[0] = true;
 }
 
 /* ---- Undo / Redo ---- */
@@ -1110,8 +1178,40 @@ window.addEventListener('keydown', e=>{
 
 /* ---- Cache slice (safe Base64 encoder) ---- */
 async function cacheCurrentSlice(){
-  // capture current mask canvas for BOTH 2D and 3D
-  const blob = await new Promise(res => mask.toBlob(res, 'image/png'));
+  const maskData = mctx.getImageData(0, 0, mask.width, mask.height);
+  const pixels = maskData.data;
+
+  const grayscaleData = mctx.createImageData(mask.width, mask.height);
+  const grayPixels = grayscaleData.data;
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    const a = pixels[i + 3];
+    
+    const isMaskOverlay = (a > 50 && (r > 200 || g > 200 || b > 200));
+    
+    if (isMaskOverlay) {
+      grayPixels[i] = 255;
+      grayPixels[i + 1] = 255;
+      grayPixels[i + 2] = 255;
+      grayPixels[i + 3] = 255;
+    } else {
+      grayPixels[i] = 0;
+      grayPixels[i + 1] = 0;
+      grayPixels[i + 2] = 0;
+      grayPixels[i + 3] = 0;
+    }
+  }
+  
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = mask.width;
+  tempCanvas.height = mask.height;
+  const tempCtx = tempCanvas.getContext('2d');
+  tempCtx.putImageData(grayscaleData, 0, 0);
+  
+  const blob = await new Promise(res => tempCanvas.toBlob(res, 'image/png'));
   const buf = await blob.arrayBuffer();
   const bytes = new Uint8Array(buf);
   let binary = '';
@@ -1120,7 +1220,7 @@ async function cacheCurrentSlice(){
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
   const b64 = btoa(binary);
-  const zKey = is3D ? z : 0;    // <— key point: 2D uses slice 0
+  const zKey = is3D ? z : 0;
   editedSlices[zKey] = b64;
 }
 
