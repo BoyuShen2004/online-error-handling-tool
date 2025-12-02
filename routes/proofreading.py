@@ -169,6 +169,79 @@ bp = Blueprint("proofreading", __name__, url_prefix="")
 def register_proofreading_routes(app):
     app.register_blueprint(bp)
 
+
+def _prepare_layer_context(layer_id: str, include_layers: bool = True):
+    session_manager = current_app.session_manager
+    session_state = session_manager.snapshot()
+
+    if not session_state.get("layers"):
+        raise RuntimeError("No detection session is currently active.")
+
+    incorrect_layers = session_manager.get_incorrect_layers() or []
+    if not incorrect_layers:
+        raise RuntimeError("No incorrect layers found for proofreading.")
+
+    current_layer = None
+    layer_index = -1
+    for idx, layer in enumerate(incorrect_layers):
+        if layer["id"] == layer_id:
+            current_layer = layer
+            layer_index = idx
+            break
+
+    if current_layer is None:
+        raise ValueError("Requested layer is not in the proofreading queue.")
+
+    slice_idx = current_layer.get("z", 0)
+    data_manager = current_app.config.get("DETECTION_DATA_MANAGER")
+    volume = current_app.config.get("DETECTION_VOLUME")
+    mask = current_app.config.get("DETECTION_MASK")
+
+    if data_manager is not None:
+        image_slice, mask_slice = data_manager.get_slice(slice_idx)
+    else:
+        if volume is None:
+            ipath = session_state.get("image_path", "")
+            volume = stack_2d_images(ipath) if isinstance(ipath, list) else load_image_or_stack(ipath)
+        if mask is None:
+            mask = load_mask_like(session_state.get("mask_path"), volume)
+
+        if getattr(volume, "ndim", 2) == 3:
+            if slice_idx >= volume.shape[0]:
+                raise ValueError(
+                    f"Slice index {slice_idx} out of range for volume with {volume.shape[0]} slices"
+                )
+            image_slice = volume[slice_idx]
+            if mask is not None and getattr(mask, "ndim", 0) == 3:
+                mask_slice = mask[slice_idx]
+            else:
+                mask_slice = mask
+        else:
+            image_slice = volume
+            mask_slice = mask
+
+    current_app.config["INTEGRATED_VOLUME"] = image_slice
+    current_app.config["INTEGRATED_MASK"] = mask_slice
+    current_app.config["CURRENT_SLICE_INDEX"] = slice_idx
+    current_app.config["CURRENT_LAYER_ID"] = layer_id
+
+    context = {
+        "layers": session_state.get("layers", []) if include_layers else [],
+        "incorrect_layers": incorrect_layers,
+        "current_layer": current_layer,
+        "layer_index": layer_index,
+        "total_incorrect": len(incorrect_layers),
+        "progress": session_manager.get_progress_stats(),
+        "mode3d": False,
+        "image_path": session_state.get("image_path", ""),
+        "mask_path": session_state.get("mask_path", ""),
+        "num_slices": 1,
+        "volume_shape": getattr(image_slice, "shape", None),
+        "mask_shape": getattr(mask_slice, "shape", None) if mask_slice is not None else None,
+        "slice_index": slice_idx,
+    }
+    return context
+
 @bp.route("/proofreading")
 def proofreading():
     """Layer selection page for incorrect layers."""
@@ -210,107 +283,27 @@ def proofreading():
 @bp.route("/proofreading/edit/<layer_id>")
 def proofreading_edit(layer_id):
     """Proofreading editor for a specific incorrect layer."""
-    session_manager = current_app.session_manager
-    session_state = session_manager.snapshot()
-    
-    if not session_state.get("layers"):
-        return redirect(url_for("landing.landing"))
-    
-    # Get all incorrect layers
-    incorrect_layers = session_manager.get_incorrect_layers()
-    
-    # Find the specific layer
-    current_layer = None
-    layer_index = -1
-    for i, layer in enumerate(incorrect_layers):
-        if layer["id"] == layer_id:
-            current_layer = layer
-            layer_index = i
-            break
-    
-    if not current_layer:
-        return redirect(url_for("proofreading.proofreading"))
-    
-    # Load volume and mask for proofreading
     try:
-        # Try to get data from detection workflow first
-        data_manager = current_app.config.get("DETECTION_DATA_MANAGER")
-        volume = current_app.config.get("DETECTION_VOLUME")
-        mask = current_app.config.get("DETECTION_MASK")
-        
-        # Get the specific slice for this incorrect layer
-        slice_idx = current_layer.get("z", 0)
-        print(f"Loading incorrect layer {current_layer['id']} at slice index {slice_idx}")
-        
-        image_slice = None
-        mask_slice = None
-        if data_manager is not None:
-            image_slice, mask_slice = data_manager.get_slice(slice_idx)
-        else:
-            # Fallback to eager loading when data manager is unavailable
-            if volume is None:
-                ipath = session_state.get("image_path", "")
-                volume = stack_2d_images(ipath) if isinstance(ipath, list) else load_image_or_stack(ipath)
-            if mask is None:
-                mask = load_mask_like(session_state.get("mask_path"), volume)
-
-            if volume.ndim == 3:
-                if slice_idx >= volume.shape[0]:
-                    raise ValueError(f"Slice index {slice_idx} out of range for volume with {volume.shape[0]} slices")
-                image_slice = volume[slice_idx]
-                mask_slice = mask[slice_idx] if mask is not None and getattr(mask, 'ndim', 0) == 3 else mask
-            else:
-                image_slice = volume
-                mask_slice = mask
-        
-        print(f"Image slice shape: {image_slice.shape}")
-        print(f"Mask slice shape: {mask_slice.shape if mask_slice is not None else 'None'}")
-        print(f"Mask slice type: {type(mask_slice)}")
-        
-        # Store only the specific slice in app config
-        current_app.config["INTEGRATED_VOLUME"] = image_slice
-        current_app.config["INTEGRATED_MASK"] = mask_slice
-        current_app.config["CURRENT_SLICE_INDEX"] = slice_idx
-        current_app.config["CURRENT_LAYER_ID"] = layer_id
-        
-        # For 2D mode, we only have 1 slice
-        num_slices = 1
-        
-        # Pass all layers to ensure navigation is visible
-        all_layers = session_state.get("layers", [])
-        
-        return render_template(
-            "proofreading.html",
-            layers=all_layers,  # Pass all layers for navigation
-            current_layer=current_layer,
-            layer_index=layer_index,
-            total_incorrect=len(incorrect_layers),
-            incorrect_layers=incorrect_layers,
-            progress=session_manager.get_progress_stats(),
-            mode3d=False,  # Always treat as 2D for incorrect layer editing
-            image_path=session_state.get("image_path", ""),
-            mask_path=session_state.get("mask_path", ""),
-            num_slices=1,  # Only editing one slice
-            volume_shape=image_slice.shape,
-            mask_shape=mask_slice.shape if mask_slice is not None else None,
-            slice_index=slice_idx
-        )
-        
+        context = _prepare_layer_context(layer_id, include_layers=True)
+        return render_template("proofreading.html", **context)
     except Exception as e:
-        # Pass all layers to ensure navigation is visible
-        all_layers = session_state.get("layers", [])
-        
+        session_manager = current_app.session_manager
+        session_state = session_manager.snapshot()
         return render_template(
             "proofreading.html",
-            layers=all_layers,  # Pass all layers for navigation
-            current_layer=current_layer,
-            layer_index=layer_index,
-            total_incorrect=len(incorrect_layers),
-            incorrect_layers=incorrect_layers,
+            layers=session_state.get("layers", []),
+            incorrect_layers=session_manager.get_incorrect_layers(),
+            current_layer=None,
+            layer_index=-1,
+            total_incorrect=0,
             progress=session_manager.get_progress_stats(),
-            mode3d=session_state.get("mode3d", False),
+            mode3d=False,
             image_path=session_state.get("image_path", ""),
             mask_path=session_state.get("mask_path", ""),
+            num_slices=1,
+            volume_shape=None,
+            mask_shape=None,
+            slice_index=0,
             warning=f"Error loading data for proofreading: {e}"
         )
 
@@ -371,6 +364,32 @@ def api_proofreading_layer(layer_id):
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/proofreading/api/load_layer", methods=["POST"])
+def api_load_proofreading_layer():
+    """AJAX endpoint to switch proofreading layers without a full page refresh."""
+    data = request.get_json(force=True) or {}
+    layer_id = data.get("layer_id")
+    if not layer_id:
+        return jsonify({"success": False, "error": "Missing layer_id"}), 400
+    try:
+        context = _prepare_layer_context(layer_id, include_layers=False)
+        response = {
+            "success": True,
+            "current_layer": context["current_layer"],
+            "layer_index": context["layer_index"],
+            "total_incorrect": context["total_incorrect"],
+            "volume_shape": context["volume_shape"],
+            "mask_shape": context["mask_shape"],
+            "slice_index": context["slice_index"],
+            "incorrect_layers": context["incorrect_layers"],
+            "progress": context["progress"],
+        }
+        return jsonify(response)
+    except Exception as exc:
+        current_app.logger.exception("Failed to load proofreading layer via API")
+        return jsonify({"success": False, "error": str(exc)}), 400
 
 @bp.route("/api/save_proofreading", methods=["POST"])
 def api_save_proofreading():

@@ -869,7 +869,7 @@ async function loadSlice(){
       overlayPixels[i] = 255;     // Red channel
       overlayPixels[i + 1] = 255; // Green channel
       overlayPixels[i + 2] = 255; // Blue channel
-      overlayPixels[i + 3] = 180; // Alpha (semi-transparent)
+      overlayPixels[i + 3] = 230; // Alpha (denser mask)
     } else {
       // No mask - transparent
       overlayPixels[i + 3] = 0;
@@ -927,7 +927,7 @@ async function loadSlice(){
             overlayPixels[i] = 255;     // Red channel (white)
             overlayPixels[i + 1] = 255; // Green channel (white)
             overlayPixels[i + 2] = 255; // Blue channel (white)
-            overlayPixels[i + 3] = 180; // Alpha (semi-transparent)
+            overlayPixels[i + 3] = 230; // Alpha (denser mask)
           } else {
             overlayPixels[i + 3] = 0; // Transparent
           }
@@ -1044,7 +1044,7 @@ function paint(e){
   
   // Draw grayscale overlay directly (white with transparency)
   if (mode === 'add') {
-    mctx.fillStyle = 'rgba(255, 255, 255, 0.7)'; // White with opacity
+    mctx.fillStyle = 'rgba(255, 255, 255, 0.9)'; // White with higher opacity
     mctx.globalCompositeOperation = 'source-over';
   } else {
     // Erase mode - draw fully opaque strokes so destination-out actually removes pixels
