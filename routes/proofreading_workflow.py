@@ -677,8 +677,8 @@ def api_layers():
         if volume is None:
             return jsonify(success=False, error="No dataset loaded"), 404
 
-        per_page = request.args.get("per_page", 12, type=int)
-        per_page = max(1, min(per_page, 48))
+        per_page = request.args.get("per_page", 36, type=int)
+        per_page = max(1, min(per_page, 72))
         page = request.args.get("page", 1, type=int)
 
         data_manager, total_slices = _ensure_proofreading_data_manager(volume, mask)

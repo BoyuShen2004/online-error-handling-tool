@@ -58,8 +58,8 @@
           <p id="layer-browser-summary">Calculating page info…</p>
         </div>
         <div class="layer-browser-controls">
-          <button id="layer-prev-page" class="btn btn-sm btn-secondary" disabled>Previous 12</button>
-          <button id="layer-next-page" class="btn btn-sm btn-primary" disabled>Load Next 12</button>
+          <button id="layer-prev-page" class="btn btn-sm btn-secondary" disabled>Previous 36</button>
+          <button id="layer-next-page" class="btn btn-sm btn-primary" disabled>Load Next 36</button>
           <div class="page-input-group">
             <label for="layer-page-input">Go to page</label>
             <input type="number" id="layer-page-input" min="1" value="1">
@@ -952,7 +952,7 @@ class LayerPagination {
     this.prevBtn = document.getElementById('layer-prev-page');
     this.pageInput = document.getElementById('layer-page-input');
     this.goBtn = document.getElementById('layer-go-button');
-    this.perPage = 12;
+    this.perPage = 36;
     this.totalLayers = Math.max(1, numSlices || 1);
     this.totalPages = Math.max(1, Math.ceil(this.totalLayers / this.perPage));
     this.currentPage = 1;

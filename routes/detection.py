@@ -27,7 +27,7 @@ def detection():
     
     # Get pagination parameters
     page = request.args.get('page', 1, type=int)
-    per_page = 12
+    per_page = 36
     
     # Get all layers and calculate pagination
     all_layers = session_state["layers"]
